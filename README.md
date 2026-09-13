@@ -4,10 +4,13 @@ Ferrite is a lightweight Minecraft launcher written in Rust.
 
 ## Why Ferrite?
 
-I started Ferrite because I felt that most minecraft launchers didn't work for me.
-I also didn't wanna just make a fork of prism (That's the launcher I usually use).
-I also just want everything to be toggle able and I mean **EVERYTHING**.
-I also hate that UI is like fucking not customizeable (when feather changed to dawn I genuinley gagged at the sight of the UI 😭😭).
+I started Ferrite because I felt that most Minecraft launchers didn't work for me.
+
+I also didn't wanna just make a fork of Prism (that's the launcher I usually use).
+
+I also just want everything to be toggleable, and I mean **EVERYTHING**.
+
+I also fucking hate when launchers don't let you customize the UI (when Feather changed to Dawn I genuinely gagged at the sight of the UI 😭😭).
 
 ## Features
 
@@ -39,7 +42,7 @@ I also hate that UI is like fucking not customizeable (when feather changed to d
     - Import from `.zip` (Generic)
     - Import from `.zip` (CurseForge)
     - Import from `.zip` (Prism / MultiMC)
-- Microsoft Authentication (Theoretically, if microslop accepts me!)
+- Microsoft Authentication (Theoretically, if Microslop accepts me!)
 - Offline mode (so in the meantime you can still use Ferrite, just without online servers)
 
 ## In Progress
@@ -48,16 +51,50 @@ IM CURRENTLY COOKING NOTHING RIGHT NOW!!!!
 
 ## Installation
 
-<!-- releases/building -->
+Go to [Releases](https://github.com/Ontogameing/ferrite-launcher/releases) and download the version for Linux, Windows, or macOS!
+
+Ferrite is still in early development, so if shit explodes don't be surprised.
 
 ## Building From Source
 
-<!-- cargo commands -->
+Download the source code or clone the project repo.
 
-## Contributing
+Make sure you have Rust and Cargo installed.
 
-## Contributing
+Clone Ferrite:
 
-- [@Ontogaming](https://github.com/Ontogaming) - Development
-- [@Claude](https://github.com/claude) - I'm basically fucking solo gng
+```bash
+git clone https://github.com/Ontogameing/ferrite-launcher.git
+cd ferrite-launcher
+```
+
+Then run:
+
+```bash
+cargo run
+```
+
+Or, if you want to build an optimized release version:
+
+```bash
+cargo build --release
+```
+
+The executable will be in:
+
+```text
+target/release/
+```
+
+## Contributors
+
+- [@Ontogameing](https://github.com/Ontogameing) - Development
 - [@AvatarGamingYT](https://github.com/AvatarGamingYT) - Testing & Feedback
+
+## Contributing
+
+Ferrite is free and open source, so contributions are welcome!
+
+If you find a bug, have a feature idea, or want to contribute code, feel free to open an issue or pull request.
+
+Just keep in mind that Ferrite is still in early development and shit changes **A LOT**.
