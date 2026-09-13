@@ -9,6 +9,7 @@ mod instances;
 mod loaders;
 mod minecraft;
 mod modrinth;
+mod packs;
 
 /// Runs [`app::run`] and reports native window startup failures to the caller.
 fn main() -> eframe::Result {

@@ -23,10 +23,18 @@ const META_BASE: &str = "https://meta.quiltmc.org/v3/versions/loader";
 /// the vanilla install (installing that first if it isn't already
 /// present).
 pub fn install(mc_version: &str) -> Result<()> {
+    install_version(mc_version, None)
+}
+
+/// Installs a requested Quilt version, or the latest stable build when omitted.
+pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> {
     minecraft::install_version(mc_version)?;
 
     let client = Client::new();
-    let loader_version = latest_stable_loader_version(&client, mc_version)?;
+    let loader_version = match requested.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(version) => version.to_owned(),
+        None => latest_stable_loader_version(&client, mc_version)?,
+    };
     let composite_id = composite_id(mc_version, &loader_version);
 
     println!("Fetching Quilt profile for loader {loader_version}...");

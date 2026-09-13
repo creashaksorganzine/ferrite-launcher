@@ -44,11 +44,23 @@ const FORGE_MAVEN: &str = "https://maven.minecraftforge.net";
 
 /// Installs the latest available Forge build for `mc_version`.
 pub fn install(mc_version: &str) -> Result<()> {
+    install_version(mc_version, None)
+}
+
+/// Installs a requested Forge version, or the latest available build when omitted.
+pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> {
     minecraft::install_version(mc_version)?;
 
     let client = Client::new();
-    let forge_version = latest_forge_version(&client, mc_version)?;
-    println!("Latest Forge for {mc_version} is {forge_version}");
+    let forge_version = match requested.map(str::trim).filter(|value| !value.is_empty()) {
+        // Older Ferrite exports accidentally retained this Maven classifier.
+        Some(version) => version
+            .strip_suffix(":universal")
+            .unwrap_or(version)
+            .to_owned(),
+        None => latest_forge_version(&client, mc_version)?,
+    };
+    println!("Installing Forge {forge_version} for Minecraft {mc_version}");
 
     // The official installer looks for `versions/<mc>/<mc>.jar`. Our
     // vanilla install writes `client.jar` instead, so give it a copy

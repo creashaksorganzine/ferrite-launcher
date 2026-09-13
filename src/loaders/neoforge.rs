@@ -40,10 +40,27 @@ enum NeoCoord {
 
 /// Installs the latest available NeoForge build for `mc_version`.
 pub fn install(mc_version: &str) -> Result<()> {
+    install_version(mc_version, None)
+}
+
+/// Installs a requested NeoForge version, or the latest available build when omitted.
+pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> {
     minecraft::install_version(mc_version)?;
 
     let client = Client::new();
-    let coord = latest_neoforge_coord(&client, mc_version)?;
+    let coord = match requested.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(version) if mc_version == "1.20.1" => NeoCoord::Legacy {
+            full: if version.starts_with("1.20.1-") {
+                version.to_owned()
+            } else {
+                format!("1.20.1-{version}")
+            },
+        },
+        Some(version) => NeoCoord::Modern {
+            neo: version.to_owned(),
+        },
+        None => latest_neoforge_coord(&client, mc_version)?,
+    };
     let neo_label = match &coord {
         NeoCoord::Legacy { full } => full.clone(),
         NeoCoord::Modern { neo } => neo.clone(),

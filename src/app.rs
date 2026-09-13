@@ -9,7 +9,9 @@ use crate::instance_mods::InstalledMod;
 use crate::instances::InstanceProfile;
 use crate::loaders::ModLoader;
 use crate::modrinth::{ProjectDetails, SearchFilters, SearchResponse};
+use crate::packs::{ExportOptions, ImportOptions, PackFormat, PackTarget};
 use eframe::egui::{self, Color32, RichText};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -85,6 +87,29 @@ enum InstanceCreationEvent {
     Finished(Result<InstanceProfile, String>),
 }
 
+/// Results from import/export workers. Profile persistence remains on egui's thread.
+enum PackTaskEvent {
+    Progress(String),
+    Imported(Result<PackImportOutcome, String>),
+    Exported(Result<String, String>),
+}
+
+struct PackImportOutcome {
+    profile: InstanceProfile,
+    files: u64,
+    bytes: u64,
+    warnings: Vec<String>,
+    committed: bool,
+}
+
+impl Drop for PackImportOutcome {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = crate::instances::delete_game_dir(&self.profile);
+        }
+    }
+}
+
 /// Messages from one sign-in attempt; only public device instructions reach the UI.
 enum AuthEvent {
     Progress(String),
@@ -113,6 +138,8 @@ impl Drop for AuthTask {
 struct AccountSession {
     account: Option<Account>,
     client_id: String,
+    /// Explicit opt-in to placeholder credentials for single-player/offline servers.
+    offline_mode: bool,
     open: bool,
     task: Option<AuthTask>,
     device: Option<(String, String)>,
@@ -147,6 +174,18 @@ struct Ferrite {
     selected_version: String,
     /// The mod-loader label selected for the instance being created.
     selected_loader: String,
+    /// Import/export dialogs and their single serialized background worker.
+    import_pack_open: bool,
+    export_pack_open: bool,
+    pack_path: String,
+    pack_name: String,
+    pack_format: PackFormat,
+    pack_version: String,
+    pack_loader_version: String,
+    pack_include_worlds: bool,
+    pack_include_optional: bool,
+    pack_task: Option<Receiver<PackTaskEvent>>,
+    pack_status: Option<String>,
     /// Release versions fetched from Mojang.
     versions: Vec<String>,
     /// Profiles loaded from and saved to the persistent instance store.
@@ -211,6 +250,17 @@ impl Default for Ferrite {
                 .cloned()
                 .unwrap_or_else(|| String::from("26.2")),
             selected_loader: String::from("Vanilla"),
+            import_pack_open: false,
+            export_pack_open: false,
+            pack_path: String::new(),
+            pack_name: String::new(),
+            pack_format: PackFormat::Ferrite,
+            pack_version: String::from("1.0.0"),
+            pack_loader_version: String::new(),
+            pack_include_worlds: true,
+            pack_include_optional: false,
+            pack_task: None,
+            pack_status: None,
             versions,
             instances,
             selected_instance,
@@ -324,9 +374,23 @@ impl Ferrite {
         }
     }
 
-    /// Shows account identity and expiry, with the same dialog available from Play and Settings.
+    /// Shows the launch authentication mode and account state on Play and Settings.
     fn account_section(&mut self, ui: &mut egui::Ui) {
         ui.heading("Account");
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.auth.offline_mode, false, "Microsoft account");
+            ui.selectable_value(&mut self.auth.offline_mode, true, "Offline mode");
+        });
+
+        if self.auth.offline_mode {
+            ui.label("Offline mode uses the name 'Player' and does not require Microsoft sign-in.");
+            ui.label(
+                RichText::new("Online-mode servers and paid-account services will not work.")
+                    .color(MUTED),
+            );
+            return;
+        }
+
         if let Some(account) = &self.auth.account {
             ui.label(format!("Signed in as {}", account.name));
             ui.label(if account.is_expired() {
@@ -417,7 +481,7 @@ impl Ferrite {
     /// The worker installs files only; profile-list persistence remains on egui's
     /// thread. Inputs stay intact until installation and persistence both succeed.
     fn create_instance(&mut self) {
-        if self.instance_creation_task.is_some() {
+        if self.instance_creation_task.is_some() || self.pack_busy() {
             return;
         }
         self.instance_creation_status = None;
@@ -552,23 +616,315 @@ impl Ferrite {
         self.create_instance_open = true;
     }
 
-    /// Launches the active profile in its isolated game directory.
-    fn launch_selected(&mut self) {
-        let auth_error = match self.auth.account.as_ref() {
-            None => Some("Sign in with Microsoft before launching."),
+    fn pack_busy(&self) -> bool {
+        self.pack_task.is_some()
+    }
+
+    /// Imports, downloads, and installs a pack entirely away from egui's thread.
+    fn start_pack_import(&mut self) {
+        if self.pack_busy()
+            || self.instance_creation_task.is_some()
+            || self.mod_task.is_some()
+            || self.pending_uninstall.is_some()
+            || crate::minecraft::is_running()
+        {
+            self.pack_status = Some("Stop Minecraft and finish other instance work first.".into());
+            return;
+        }
+        let source = PathBuf::from(self.pack_path.trim());
+        if self.pack_path.trim().is_empty() || !source.is_file() {
+            self.pack_status = Some("Choose an existing pack archive path.".into());
+            return;
+        }
+        let Some(generic_loader) = self.selected_loader() else {
+            self.pack_status = Some("Select a valid loader for generic ZIP imports.".into());
+            return;
+        };
+        let generic_target = PackTarget {
+            minecraft_version: self.selected_version.clone(),
+            loader: generic_loader,
+            loader_version: None,
+        };
+        let requested_name = self.pack_name.trim().to_owned();
+        let existing = self.instances.clone();
+        let include_optional = self.pack_include_optional;
+        let curseforge_api_key = std::env::var("FERRITE_CURSEFORGE_API_KEY").ok();
+        let (sender, receiver) = mpsc::channel();
+        let event_sender = sender.clone();
+        let worker = std::thread::Builder::new()
+            .name("pack-import".to_owned())
+            .spawn(move || {
+                let result = (|| -> Result<PackImportOutcome, String> {
+                    let info = crate::packs::inspect(&source).map_err(|error| error.to_string())?;
+                    let target = info.target.clone().unwrap_or(generic_target);
+                    let base_name = if requested_name.is_empty() {
+                        info.name.trim().to_owned()
+                    } else {
+                        requested_name
+                    };
+                    if base_name.is_empty() {
+                        return Err("The imported instance needs a name.".into());
+                    }
+                    let mut name = base_name.clone();
+                    let mut suffix = 2;
+                    loop {
+                        let candidate = InstanceProfile::new(
+                            name.clone(),
+                            target.minecraft_version.clone(),
+                            target.loader.label().to_owned(),
+                            &existing,
+                        );
+                        if !existing.iter().any(|profile| profile.name == name)
+                            && !candidate.game_dir().exists()
+                        {
+                            break;
+                        }
+                        name = format!("{base_name} ({suffix})");
+                        suffix += 1;
+                    }
+                    let profile = InstanceProfile::new(
+                        name,
+                        target.minecraft_version.clone(),
+                        target.loader.label().to_owned(),
+                        &existing,
+                    );
+                    let parent = profile
+                        .game_dir()
+                        .parent()
+                        .expect("instance game directory has a parent")
+                        .to_owned();
+                    std::fs::create_dir_all(parent)
+                        .map_err(|error| format!("Failed to prepare instance storage: {error}"))?;
+                    let options = ImportOptions {
+                        generic_target: Some(target.clone()),
+                        include_optional_modrinth_files: include_optional,
+                        curseforge_api_key,
+                        ..ImportOptions::default()
+                    };
+                    let report = crate::packs::import(&source, profile.game_dir(), &options, |step| {
+                        let _ = event_sender.send(PackTaskEvent::Progress(step.to_owned()));
+                    })
+                    .map_err(|error| error.to_string())?;
+                    if report.info.target.as_ref() != Some(&target) {
+                        let _ = crate::instances::delete_game_dir(&profile);
+                        return Err("The pack changed while it was being imported; no instance was kept.".into());
+                    }
+
+                    let install = (|| -> Result<(), String> {
+                        let _ = event_sender.send(PackTaskEvent::Progress(
+                            "Installing Minecraft files...".into(),
+                        ));
+                        crate::minecraft::install_version_with_progress(
+                            &target.minecraft_version,
+                            |message| {
+                                let _ = event_sender
+                                    .send(PackTaskEvent::Progress(message.to_owned()));
+                            },
+                        )
+                        .map_err(|error| format!("Failed to install Minecraft: {error}"))?;
+                        if target.loader != ModLoader::Vanilla {
+                            let _ = event_sender.send(PackTaskEvent::Progress(format!(
+                                "Installing {}...",
+                                target.loader.label()
+                            )));
+                            crate::loaders::install_version(
+                                &target.minecraft_version,
+                                target.loader,
+                                target.loader_version.as_deref(),
+                            )
+                            .map_err(|error| {
+                                format!("Failed to install {}: {error}", target.loader.label())
+                            })?;
+                            if let Some(requested) = target.loader_version.as_deref() {
+                                let installed = crate::loaders::installed_loader_version(
+                                    &target.minecraft_version,
+                                    target.loader,
+                                );
+                                if installed.as_deref() != Some(requested) {
+                                    return Err(format!(
+                                        "Pack requires {} {requested}, but Ferrite installed {}. Exact loader-version installation is required for this pack.",
+                                        target.loader.label(),
+                                        installed.as_deref().unwrap_or("an unknown version")
+                                    ));
+                                }
+                            }
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = install {
+                        let _ = crate::instances::delete_game_dir(&profile);
+                        return Err(error);
+                    }
+                    Ok(PackImportOutcome {
+                        profile,
+                        files: report.files_written,
+                        bytes: report.bytes_written,
+                        warnings: report.warnings,
+                        committed: false,
+                    })
+                })();
+                let _ = sender.send(PackTaskEvent::Imported(result));
+            });
+        match worker {
+            Ok(_) => {
+                self.pack_task = Some(receiver);
+                self.pack_status = Some("Inspecting pack...".into());
+            }
+            Err(error) => self.pack_status = Some(format!("Failed to start import: {error}")),
+        }
+    }
+
+    /// Exports one immutable profile snapshot on a worker thread.
+    fn start_pack_export(&mut self) {
+        if self.pack_busy()
+            || self.instance_creation_task.is_some()
+            || self.mod_task.is_some()
+            || self.pending_uninstall.is_some()
+            || crate::minecraft::is_running()
+        {
+            self.pack_status = Some("Stop Minecraft and finish other instance work first.".into());
+            return;
+        }
+        let Some(profile) = self.selected_instance().cloned() else {
+            self.pack_status = Some("Select an instance to export.".into());
+            return;
+        };
+        let mut output = PathBuf::from(self.pack_path.trim());
+        if self.pack_path.trim().is_empty() {
+            self.pack_status = Some("Enter an output archive path.".into());
+            return;
+        }
+        output.set_extension(self.pack_format.extension());
+        let output_display = output.display().to_string();
+        let options = ExportOptions {
+            format: self.pack_format,
+            name: if self.pack_name.trim().is_empty() {
+                profile.name.clone()
+            } else {
+                self.pack_name.trim().to_owned()
+            },
+            version: (!self.pack_version.trim().is_empty())
+                .then(|| self.pack_version.trim().to_owned()),
+            summary: None,
+            loader_version: (!self.pack_loader_version.trim().is_empty())
+                .then(|| self.pack_loader_version.trim().to_owned()),
+            include_worlds: self.pack_include_worlds,
+        };
+        let (sender, receiver) = mpsc::channel();
+        let event_sender = sender.clone();
+        let worker = std::thread::Builder::new()
+            .name("pack-export".to_owned())
+            .spawn(move || {
+                let result = crate::packs::export(&profile, &output, &options, |step| {
+                    let _ = event_sender.send(PackTaskEvent::Progress(step.to_owned()));
+                })
+                .map(|()| output_display)
+                .map_err(|error| error.to_string());
+                let _ = sender.send(PackTaskEvent::Exported(result));
+            });
+        match worker {
+            Ok(_) => {
+                self.pack_task = Some(receiver);
+                self.pack_status = Some("Preparing export...".into());
+            }
+            Err(error) => self.pack_status = Some(format!("Failed to start export: {error}")),
+        }
+    }
+
+    /// Polls globally so changing pages or closing a dialog never loses completion.
+    fn poll_pack_task(&mut self) {
+        loop {
+            let Some(receiver) = &self.pack_task else {
+                return;
+            };
+            match receiver.try_recv() {
+                Ok(PackTaskEvent::Progress(message)) => self.pack_status = Some(message),
+                Ok(PackTaskEvent::Imported(result)) => {
+                    self.pack_task = None;
+                    match result {
+                        Ok(mut outcome) => {
+                            let name = outcome.profile.name.clone();
+                            self.instances.push(outcome.profile.clone());
+                            if let Err(error) = crate::instances::save(&self.instances) {
+                                self.instances.pop();
+                                self.pack_status = Some(format!(
+                                    "Imported files but could not save the instance: {error}"
+                                ));
+                                return;
+                            }
+                            outcome.committed = true;
+                            self.selected_instance = Some(self.instances.len() - 1);
+                            let mib = outcome.bytes as f64 / (1024.0 * 1024.0);
+                            let warning = if outcome.warnings.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" Warnings: {}", outcome.warnings.join(" "))
+                            };
+                            let message = format!(
+                                "Imported '{name}' ({} files, {mib:.1} MiB).{warning}",
+                                outcome.files
+                            );
+                            self.pack_status = Some(message.clone());
+                            self.running_text = message;
+                            self.import_pack_open = false;
+                        }
+                        Err(error) => {
+                            self.pack_status = Some(format!("Import failed: {error}"));
+                            self.running_text = format!("Import failed: {error}");
+                        }
+                    }
+                    return;
+                }
+                Ok(PackTaskEvent::Exported(result)) => {
+                    self.pack_task = None;
+                    let message = match result {
+                        Ok(path) => {
+                            self.export_pack_open = false;
+                            format!("Exported instance to {path}.")
+                        }
+                        Err(error) => format!("Export failed: {error}"),
+                    };
+                    self.pack_status = Some(message.clone());
+                    self.running_text = message;
+                    return;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.pack_task = None;
+                    let message = "The import/export worker stopped unexpectedly.".to_owned();
+                    self.pack_status = Some(message.clone());
+                    self.running_text = message;
+                    return;
+                }
+                Err(TryRecvError::Empty) => return,
+            }
+        }
+    }
+
+    /// Returns an account error only when authenticated mode is selected.
+    fn launch_auth_error(&self) -> Option<&'static str> {
+        if self.auth.offline_mode {
+            return None;
+        }
+        match self.auth.account.as_ref() {
+            None => Some("Sign in with Microsoft before launching, or select Offline mode."),
             Some(account) if account.is_expired() => {
                 Some("Session expired. Please sign in again before launching.")
             }
             Some(_) => None,
-        };
-        if let Some(message) = auth_error {
+        }
+    }
+
+    /// Launches the active profile in its isolated game directory.
+    fn launch_selected(&mut self) {
+        if let Some(message) = self.launch_auth_error() {
             self.running_text = message.into();
             self.auth.status = message.into();
             self.auth.open = true;
             return;
         }
-        if self.mod_task.is_some() || self.pending_uninstall.is_some() {
-            self.running_text = "Wait for mod management to finish before launching.".into();
+        if self.mod_task.is_some() || self.pending_uninstall.is_some() || self.pack_busy() {
+            self.running_text =
+                "Wait for mod or instance import/export work to finish before launching.".into();
             return;
         }
         let Some(instance) = self.selected_instance() else {
@@ -585,12 +941,18 @@ impl Ferrite {
             return;
         };
 
-        self.running_text = match crate::loaders::launch_authenticated(
-            &version,
-            loader,
-            &game_dir,
-            self.auth.account.as_ref().expect("account checked above"),
-        ) {
+        let result = if self.auth.offline_mode {
+            crate::loaders::launch_in_directory(&version, loader, &game_dir)
+        } else {
+            crate::loaders::launch_authenticated(
+                &version,
+                loader,
+                &game_dir,
+                self.auth.account.as_ref().expect("account checked above"),
+            )
+        };
+        self.running_text = match result {
+            Ok(()) if self.auth.offline_mode => format!("Launched '{name}' in offline mode."),
             Ok(()) => format!("Launched '{name}'."),
             Err(error) => format!("Failed to launch '{name}': {error}"),
         };
@@ -600,6 +962,7 @@ impl Ferrite {
     fn remove_selected(&mut self) {
         if self.mod_task.is_some()
             || self.pending_uninstall.is_some()
+            || self.pack_busy()
             || crate::minecraft::is_running()
         {
             self.running_text =
@@ -728,12 +1091,26 @@ impl Ferrite {
     fn instances_page(&mut self, ui: &mut egui::Ui) {
         page_heading(ui, "Instances", "Manage your Minecraft profiles.");
         ui.add_space(8.0);
-        if ui
-            .add(egui::Button::new("＋ Create instance").fill(ACCENT))
-            .clicked()
-        {
-            self.create_instance_open = true;
-        }
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.pack_busy(),
+                    egui::Button::new("＋ Create instance").fill(ACCENT),
+                )
+                .clicked()
+            {
+                self.create_instance_open = true;
+            }
+            if ui
+                .add_enabled(!self.pack_busy(), egui::Button::new("Import pack"))
+                .clicked()
+            {
+                self.pack_path.clear();
+                self.pack_name.clear();
+                self.pack_status = None;
+                self.import_pack_open = true;
+            }
+        });
         ui.add_space(20.0);
 
         if self.instances.is_empty() {
@@ -747,8 +1124,10 @@ impl Ferrite {
 
         let mut launch = false;
         let mut remove = false;
+        let mut export = false;
         let mut mods = None;
-        let mod_idle = self.mod_task.is_none() && self.pending_uninstall.is_none();
+        let mod_idle =
+            self.mod_task.is_none() && self.pending_uninstall.is_none() && !self.pack_busy();
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (index, instance) in self.instances.iter().enumerate() {
                 let selected = self.selected_instance == Some(index);
@@ -805,6 +1184,16 @@ impl Ferrite {
                             if ui
                                 .add_enabled(
                                     mod_idle && !crate::minecraft::is_running(),
+                                    egui::Button::new("Export"),
+                                )
+                                .clicked()
+                            {
+                                self.selected_instance = Some(index);
+                                export = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    mod_idle && !crate::minecraft::is_running(),
                                     egui::Button::new("Remove"),
                                 )
                                 .clicked()
@@ -825,6 +1214,19 @@ impl Ferrite {
         }
         if launch {
             self.launch_selected();
+        } else if export {
+            if let Some(name) = self
+                .selected_instance()
+                .map(|instance| instance.name.clone())
+            {
+                self.pack_path = format!("{}.ferritepack", name.replace(['/', '\\'], "-"));
+                self.pack_name = name;
+            }
+            self.pack_format = PackFormat::Ferrite;
+            self.pack_include_worlds = true;
+            self.pack_loader_version.clear();
+            self.pack_status = None;
+            self.export_pack_open = true;
         } else if remove {
             self.remove_selected();
         }
@@ -844,7 +1246,7 @@ impl Ferrite {
 
     /// Serializes all mod work, including searches triggered by Enter.
     fn start_mod_task(&mut self, work: impl FnOnce() -> ModTaskResult + Send + 'static) {
-        if self.mod_task.is_some() || self.pending_uninstall.is_some() {
+        if self.mod_task.is_some() || self.pending_uninstall.is_some() || self.pack_busy() {
             return;
         }
         let (sender, receiver) = mpsc::channel();
@@ -1548,6 +1950,160 @@ impl Ferrite {
         }
     }
 
+    fn import_pack_window(&mut self, context: &egui::Context) {
+        if !self.import_pack_open {
+            return;
+        }
+        let mut open = self.import_pack_open;
+        let mut import_requested = false;
+        egui::Window::new("Import instance pack")
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(500.0)
+            .show(context, |ui| {
+                ui.label("Supported: Ferrite, Modrinth, Prism/MultiMC, CurseForge, and generic ZIP archives.");
+                ui.label("Archive contents are validated and staged before the instance is committed.");
+                ui.add_space(8.0);
+                ui.add_enabled_ui(!self.pack_busy(), |ui| {
+                    ui.label("Archive path");
+                    ui.text_edit_singleline(&mut self.pack_path);
+                    ui.label("Instance name override (optional)");
+                    ui.text_edit_singleline(&mut self.pack_name);
+                    ui.separator();
+                    ui.label("Fallback metadata for generic ZIP files");
+                    egui::ComboBox::from_label("Minecraft version")
+                        .selected_text(&self.selected_version)
+                        .show_ui(ui, |ui| {
+                            for version in &self.versions {
+                                ui.selectable_value(
+                                    &mut self.selected_version,
+                                    version.clone(),
+                                    version,
+                                );
+                            }
+                        });
+                    egui::ComboBox::from_label("Mod loader")
+                        .selected_text(&self.selected_loader)
+                        .show_ui(ui, |ui| {
+                            for loader in ModLoader::ALL {
+                                ui.selectable_value(
+                                    &mut self.selected_loader,
+                                    loader.label().to_owned(),
+                                    loader.label(),
+                                );
+                            }
+                        });
+                    ui.checkbox(
+                        &mut self.pack_include_optional,
+                        "Install optional client files from Modrinth packs",
+                    );
+                    ui.label("CurseForge packs containing indexed mods require FERRITE_CURSEFORGE_API_KEY.");
+                    ui.add_space(8.0);
+                    import_requested = ui
+                        .add_enabled(
+                            !self.pack_path.trim().is_empty(),
+                            egui::Button::new("Import and install").fill(ACCENT),
+                        )
+                        .clicked();
+                });
+                if self.pack_busy() {
+                    ui.spinner();
+                }
+                if let Some(status) = &self.pack_status {
+                    ui.label(status);
+                }
+            });
+        self.import_pack_open = open;
+        if import_requested {
+            self.start_pack_import();
+        }
+    }
+
+    fn export_pack_window(&mut self, context: &egui::Context) {
+        if !self.export_pack_open {
+            return;
+        }
+        let mut open = self.export_pack_open;
+        let mut export_requested = false;
+        egui::Window::new("Export instance")
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(500.0)
+            .show(context, |ui| {
+                ui.add_enabled_ui(!self.pack_busy(), |ui| {
+                    ui.label("Output path (the usual extension is added when omitted)");
+                    ui.text_edit_singleline(&mut self.pack_path);
+                    ui.label("Pack name");
+                    ui.text_edit_singleline(&mut self.pack_name);
+                    ui.label("Pack version");
+                    ui.text_edit_singleline(&mut self.pack_version);
+                    let previous = self.pack_format;
+                    egui::ComboBox::from_label("Format")
+                        .selected_text(self.pack_format.label())
+                        .show_ui(ui, |ui| {
+                            for format in PackFormat::ALL {
+                                ui.selectable_value(&mut self.pack_format, format, format.label());
+                            }
+                        });
+                    if previous != self.pack_format {
+                        self.pack_include_worlds = matches!(
+                            self.pack_format,
+                            PackFormat::Ferrite | PackFormat::GenericZip
+                        );
+                        if !self.pack_path.trim().is_empty() {
+                            let mut output = PathBuf::from(self.pack_path.trim());
+                            output.set_extension(self.pack_format.extension());
+                            self.pack_path = output.display().to_string();
+                        }
+                    }
+                    if self.pack_format == PackFormat::Lunar {
+                        ui.label(RichText::new("Direct .lcpack export is unavailable because Lunar does not publish its schema. Lunar can import the Modrinth and CurseForge formats.").color(MUTED));
+                    }
+                    let modded = self
+                        .selected_instance()
+                        .is_some_and(|profile| profile.loader != "Vanilla");
+                    if modded
+                        && matches!(
+                            self.pack_format,
+                            PackFormat::Modrinth | PackFormat::Prism | PackFormat::CurseForge
+                        )
+                    {
+                        ui.label("Exact loader version required by this format");
+                        ui.text_edit_singleline(&mut self.pack_loader_version);
+                    }
+                    ui.checkbox(&mut self.pack_include_worlds, "Include worlds/saves");
+                    if matches!(
+                        self.pack_format,
+                        PackFormat::Modrinth | PackFormat::Prism | PackFormat::CurseForge
+                    ) && self.pack_include_worlds
+                    {
+                        ui.label(RichText::new("Warning: distributable packs normally exclude private worlds.").color(MUTED));
+                    }
+                    if matches!(self.pack_format, PackFormat::Modrinth | PackFormat::CurseForge) {
+                        ui.label("This is an override-based export: Ferrite does not invent provider project IDs or download provenance for local JARs.");
+                    }
+                    ui.add_space(8.0);
+                    export_requested = ui
+                        .add_enabled(
+                            !self.pack_path.trim().is_empty()
+                                && self.pack_format != PackFormat::Lunar,
+                            egui::Button::new("Export instance").fill(ACCENT),
+                        )
+                        .clicked();
+                });
+                if self.pack_busy() {
+                    ui.spinner();
+                }
+                if let Some(status) = &self.pack_status {
+                    ui.label(status);
+                }
+            });
+        self.export_pack_open = open;
+        if export_requested {
+            self.start_pack_export();
+        }
+    }
+
     /// Draws the modal form used to create a persisted instance.
     fn create_instance_window(&mut self, context: &egui::Context) {
         if !self.create_instance_open {
@@ -1611,6 +2167,7 @@ impl Ferrite {
 impl eframe::App for Ferrite {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_instance_creation();
+        self.poll_pack_task();
         self.poll_mod_task();
         self.poll_auth();
         ui.style_mut().visuals = egui::Visuals::dark();
@@ -1669,6 +2226,8 @@ impl eframe::App for Ferrite {
                             self.instance_creation_status
                                 .as_deref()
                                 .unwrap_or(&self.running_text)
+                        } else if self.pack_task.is_some() {
+                            self.pack_status.as_deref().unwrap_or(&self.running_text)
                         } else {
                             &self.running_text
                         };
@@ -1679,8 +2238,11 @@ impl eframe::App for Ferrite {
 
         self.account_window(ui.ctx());
         self.create_instance_window(ui.ctx());
+        self.import_pack_window(ui.ctx());
+        self.export_pack_window(ui.ctx());
         self.uninstall_window(ui.ctx());
         if self.instance_creation_task.is_some()
+            || self.pack_task.is_some()
             || self.mod_task.is_some()
             || self.auth.task.is_some()
         {
@@ -1766,6 +2328,17 @@ mod tests {
             instance_creation_status: None,
             selected_version: "1.21.1".into(),
             selected_loader: "Fabric".into(),
+            import_pack_open: false,
+            export_pack_open: false,
+            pack_path: String::new(),
+            pack_name: String::new(),
+            pack_format: PackFormat::Ferrite,
+            pack_version: "1.0.0".into(),
+            pack_loader_version: String::new(),
+            pack_include_worlds: true,
+            pack_include_optional: false,
+            pack_task: None,
+            pack_status: None,
             versions: Vec::new(),
             instances: Vec::new(),
             selected_instance: None,
@@ -1801,7 +2374,16 @@ mod tests {
         app.launch_selected();
         assert!(app.auth.open);
         assert!(app.running_text.contains("Sign in with Microsoft"));
+        assert!(app.running_text.contains("Offline mode"));
         assert!(app.auth.task.is_none());
+    }
+
+    #[test]
+    fn offline_mode_bypasses_account_requirement() {
+        let mut app = app();
+        assert!(app.launch_auth_error().is_some());
+        app.auth.offline_mode = true;
+        assert!(app.launch_auth_error().is_none());
     }
 
     #[test]
@@ -1918,6 +2500,25 @@ mod tests {
         assert_eq!(app.instance_name, "My new instance");
         assert!(app.running_text.contains("Network interrupted"));
         assert!(app.instances.is_empty());
+    }
+
+    #[test]
+    fn pack_worker_progress_and_failure_are_polled_globally() {
+        let mut app = app();
+        let (sender, receiver) = mpsc::channel();
+        app.pack_task = Some(receiver);
+        sender
+            .send(PackTaskEvent::Progress("Validating archive".into()))
+            .unwrap();
+        app.poll_pack_task();
+        assert_eq!(app.pack_status.as_deref(), Some("Validating archive"));
+        assert!(app.pack_busy());
+        sender
+            .send(PackTaskEvent::Exported(Err("disk full".into())))
+            .unwrap();
+        app.poll_pack_task();
+        assert!(!app.pack_busy());
+        assert!(app.running_text.contains("disk full"));
     }
 
     #[test]

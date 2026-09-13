@@ -1176,10 +1176,13 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui",
+ "hex",
  "image",
  "reqwest",
  "serde",
  "serde_json",
+ "sha1",
+ "sha2",
  "zip",
 ]
 
