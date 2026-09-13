@@ -126,6 +126,17 @@ pub fn launch_in_directory(mc_version: &str, loader: ModLoader, game_dir: &Path)
     minecraft::launch_version_in_directory(&version, game_dir)
 }
 
+/// Offline launch with the configured maximum Java heap size.
+pub fn launch_in_directory_with_memory(
+    mc_version: &str,
+    loader: ModLoader,
+    game_dir: &Path,
+    memory_mb: u32,
+) -> Result<()> {
+    let version = prepare_launch_version(mc_version, loader)?;
+    minecraft::launch_version_in_directory_with_memory(&version, game_dir, memory_mb)
+}
+
 /// Launches with an authenticated Microsoft account and per-instance game data.
 /// Expired sessions fail before loader preparation; there is no offline fallback.
 /// Installed versions, libraries, assets, and natives remain in shared storage.
@@ -140,6 +151,21 @@ pub fn launch_authenticated(
     }
     let version = prepare_launch_version(mc_version, loader)?;
     minecraft::launch_authenticated(&version, game_dir, account)
+}
+
+/// Authenticated launch with the configured maximum Java heap size.
+pub fn launch_authenticated_with_memory(
+    mc_version: &str,
+    loader: ModLoader,
+    game_dir: &Path,
+    account: &crate::auth::Account,
+    memory_mb: u32,
+) -> Result<()> {
+    if account.is_expired() {
+        return Err(minecraft::FerriteError::AuthenticationExpired);
+    }
+    let version = prepare_launch_version(mc_version, loader)?;
+    minecraft::launch_authenticated_with_memory(&version, game_dir, account, memory_mb)
 }
 
 fn prepare_launch_version(mc_version: &str, loader: ModLoader) -> Result<String> {

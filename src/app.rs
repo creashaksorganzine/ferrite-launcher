@@ -4,6 +4,7 @@
 //! calls to the Minecraft, mod-loader, and persistent instance backends.
 
 use crate::auth::Account;
+use crate::config::Config;
 use crate::discord::DiscordPresence;
 use crate::icons::IconCache;
 use crate::instance_mods::InstalledMod;
@@ -149,6 +150,13 @@ struct AccountSession {
 
 /// All state required to render and interact with the Ferrite Launcher UI.
 struct Ferrite {
+    /// Persistent non-secret launcher preferences.
+    config: Config,
+    /// Advanced editor state is separate so keystrokes never mutate live settings.
+    raw_config_toml: String,
+    config_status: Option<String>,
+    accent_edit: String,
+    close_requested: bool,
     /// Session credentials and a worker cancelled automatically when the app drops.
     auth: AccountSession,
     /// A short result/status message displayed at the bottom of the window.
@@ -159,8 +167,7 @@ struct Ferrite {
     current_settings_tab: String,
     /// Temporary state for the placeholder Global settings control.
     is_global_checked: bool,
-    /// Temporary state for the placeholder Launcher settings control.
-    is_launcher_checked: bool,
+
     /// Temporary state for the placeholder Appearance settings control.
     is_appearance_checked: bool,
     /// Whether the create-instance dialog should be drawn this frame.
@@ -209,31 +216,59 @@ struct Ferrite {
     mod_task: Option<Receiver<ModTaskResult>>,
     /// Bounded asynchronous icon decoding shared by browser and installed mods.
     icons: IconCache,
-    /// Rich Presence is opted in by default, independently of Discord availability.
-    discord_enabled: bool,
+    /// Live IPC connection governed by `config.discord.rich_presence`.
     discord: Option<DiscordPresence>,
 }
 
 impl Default for Ferrite {
     fn default() -> Self {
-        let versions = match crate::minecraft::get_versions() {
-            Ok(versions) => versions,
-            Err(error) => {
-                eprintln!("Failed to fetch Minecraft versions: {error}");
-                Vec::new()
-            }
+        let loaded_config = crate::config::load_or_create();
+        let (config, config_warning) = match loaded_config {
+            Ok(loaded) => (loaded.config, loaded.warning),
+            Err(error) => (
+                Config::default(),
+                Some(format!(
+                    "Could not load Ferrite configuration: {error}. Using defaults."
+                )),
+            ),
         };
+        let discord = if config.discord.rich_presence {
+            DiscordPresence::new()
+        } else {
+            None
+        };
+        let raw_config_toml = crate::config::read_toml()
+            .or_else(|_| crate::config::to_toml(&config))
+            .unwrap_or_default();
+        let accent_edit = config.appearance.accent.clone();
 
-        let (instances, running_text) = match crate::instances::load() {
+        let versions =
+            match crate::minecraft::get_versions_with_snapshots(config.launcher.show_snapshots) {
+                Ok(versions) => versions,
+                Err(error) => {
+                    eprintln!("Failed to fetch Minecraft versions: {error}");
+                    Vec::new()
+                }
+            };
+
+        let (instances, mut running_text) = match crate::instances::load() {
             Ok(instances) => (instances, String::from("Game not running.")),
             Err(error) => (
                 Vec::new(),
                 format!("Failed to load saved instances: {error}"),
             ),
         };
+        if let Some(warning) = config_warning {
+            running_text = warning;
+        }
         let selected_instance = (!instances.is_empty()).then_some(0);
 
         Self {
+            config,
+            raw_config_toml,
+            config_status: None,
+            accent_edit,
+            close_requested: false,
             auth: AccountSession {
                 client_id: std::env::var("FERRITE_MICROSOFT_CLIENT_ID").unwrap_or_default(),
                 ..Default::default()
@@ -243,7 +278,6 @@ impl Default for Ferrite {
             current_page: Page::Play,
             current_settings_tab: String::from("Global"),
             is_global_checked: false,
-            is_launcher_checked: false,
             is_appearance_checked: false,
             create_instance_open: false,
             instance_name: String::new(),
@@ -278,30 +312,111 @@ impl Default for Ferrite {
             show_installed: false,
             pending_uninstall: None,
             mod_task: None,
-            discord_enabled: true,
-            discord: DiscordPresence::new(),
+            discord,
         }
     }
 }
 
 impl Ferrite {
-    /// Connects or disconnects Rich Presence immediately when its setting changes.
-    fn set_discord_enabled(&mut self, enabled: bool) {
-        self.discord_enabled = enabled;
-        if enabled {
+    fn sync_discord_presence(&mut self) {
+        if self.config.discord.rich_presence {
             if self.discord.is_none() {
                 self.discord = DiscordPresence::new();
             }
-            self.running_text = if self.discord.is_some() {
-                "Discord Rich Presence enabled.".into()
-            } else {
-                "Discord Rich Presence is enabled, but Discord is unavailable.".into()
-            };
+        } else if let Some(mut presence) = self.discord.take() {
+            presence.clear();
+        }
+    }
+
+    /// Connects or disconnects Rich Presence immediately when its setting changes.
+    fn set_discord_enabled(&mut self, enabled: bool) {
+        self.config.discord.rich_presence = enabled;
+        self.sync_discord_presence();
+        let message = if enabled && self.discord.is_some() {
+            "Discord Rich Presence enabled."
+        } else if enabled {
+            "Discord Rich Presence is enabled, but Discord is unavailable."
         } else {
-            if let Some(mut presence) = self.discord.take() {
-                presence.clear();
+            "Discord Rich Presence disabled."
+        };
+        self.save_config_change(message);
+    }
+
+    fn save_config_change(&mut self, success_message: &str) {
+        match crate::config::save(&self.config) {
+            Ok(()) => {
+                self.running_text = success_message.to_owned();
+                self.config_status = Some(success_message.to_owned());
+                self.raw_config_toml = crate::config::to_toml(&self.config).unwrap_or_default();
             }
-            self.running_text = "Discord Rich Presence disabled.".into();
+            Err(error) => {
+                let message = format!("Failed to save configuration: {error}");
+                self.running_text = message.clone();
+                self.config_status = Some(message);
+            }
+        }
+    }
+
+    fn replace_config(&mut self, config: Config, raw_toml: String, message: &str) {
+        self.config = config;
+        self.accent_edit = self.config.appearance.accent.clone();
+        self.raw_config_toml = raw_toml;
+        self.sync_discord_presence();
+        self.running_text = message.to_owned();
+        self.config_status = Some(message.to_owned());
+    }
+
+    fn reload_config(&mut self) {
+        match crate::config::load() {
+            Ok(config) => {
+                let raw = crate::config::read_toml()
+                    .or_else(|_| crate::config::to_toml(&config))
+                    .unwrap_or_default();
+                self.replace_config(config, raw, "Reloaded configuration from disk.");
+            }
+            Err(error) => {
+                self.config_status = Some(format!("Reload failed: {error}"));
+            }
+        }
+    }
+
+    fn apply_raw_config(&mut self) {
+        match crate::config::save_toml(&self.raw_config_toml) {
+            Ok(config) => {
+                let raw = crate::config::to_toml(&config).unwrap_or_default();
+                self.replace_config(config, raw, "Applied and saved configuration TOML.");
+            }
+            Err(error) => {
+                self.config_status = Some(format!("TOML was not saved: {error}"));
+            }
+        }
+    }
+
+    fn accent_color(&self) -> Color32 {
+        parse_hex_color(&self.config.appearance.accent).unwrap_or(ACCENT)
+    }
+
+    fn background_color(&self) -> Color32 {
+        if self.config.appearance.theme == "light" {
+            Color32::from_rgb(242, 244, 248)
+        } else {
+            BACKGROUND
+        }
+    }
+
+    fn sidebar_color(&self) -> Color32 {
+        if self.config.appearance.theme == "light" {
+            Color32::from_rgb(226, 230, 237)
+        } else {
+            SIDEBAR
+        }
+    }
+
+    fn card_color(&self) -> Color32 {
+        if self.config.appearance.theme == "light" {
+            Color32::WHITE
+        } else {
+            CARD
         }
     }
 
@@ -967,21 +1082,27 @@ impl Ferrite {
             return;
         };
 
+        let memory_mb = self.config.minecraft.default_memory_mb;
         let result = if self.auth.offline_mode {
-            crate::loaders::launch_in_directory(&version, loader, &game_dir)
+            crate::loaders::launch_in_directory_with_memory(&version, loader, &game_dir, memory_mb)
         } else {
-            crate::loaders::launch_authenticated(
+            crate::loaders::launch_authenticated_with_memory(
                 &version,
                 loader,
                 &game_dir,
                 self.auth.account.as_ref().expect("account checked above"),
+                memory_mb,
             )
         };
+        let launched = result.is_ok();
         self.running_text = match result {
             Ok(()) if self.auth.offline_mode => format!("Launched '{name}' in offline mode."),
             Ok(()) => format!("Launched '{name}'."),
             Err(error) => format!("Failed to launch '{name}': {error}"),
         };
+        if launched && self.config.launcher.close_on_launch {
+            self.close_requested = true;
+        }
     }
 
     /// Removes the active profile metadata and its isolated game files.
@@ -1029,7 +1150,12 @@ impl Ferrite {
     /// Draws the brand and primary navigation in the left sidebar.
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(18.0);
-        ui.label(RichText::new("FERRITE").size(24.0).strong().color(ACCENT));
+        ui.label(
+            RichText::new("FERRITE")
+                .size(24.0)
+                .strong()
+                .color(self.accent_color()),
+        );
         ui.label(RichText::new("LAUNCHER").size(12.0).color(MUTED));
         ui.add_space(38.0);
 
@@ -1051,8 +1177,8 @@ impl Ferrite {
         ui.add_space(24.0);
 
         egui::Frame::new()
-            .fill(CARD)
-            .corner_radius(12.0)
+            .fill(self.card_color())
+            .corner_radius(self.config.appearance.corner_radius)
             .inner_margin(24.0)
             .show(ui, |ui| {
                 ui.set_max_width(560.0);
@@ -1096,7 +1222,7 @@ impl Ferrite {
                                 && self.mod_task.is_none()
                                 && self.pending_uninstall.is_none(),
                             egui::Button::new(RichText::new("▶  PLAY").strong())
-                                .fill(ACCENT)
+                                .fill(self.accent_color())
                                 .min_size(egui::vec2(160.0, 42.0)),
                         )
                         .clicked()
@@ -1121,7 +1247,7 @@ impl Ferrite {
             if ui
                 .add_enabled(
                     !self.pack_busy(),
-                    egui::Button::new("＋ Create instance").fill(ACCENT),
+                    egui::Button::new("＋ Create instance").fill(self.accent_color()),
                 )
                 .clicked()
             {
@@ -1159,19 +1285,23 @@ impl Ferrite {
                 let selected = self.selected_instance == Some(index);
                 egui::Frame::new()
                     .fill(if selected {
-                        Color32::from_rgb(43, 39, 44)
+                        if self.config.appearance.theme == "light" {
+                            Color32::from_rgb(255, 240, 232)
+                        } else {
+                            Color32::from_rgb(43, 39, 44)
+                        }
                     } else {
-                        CARD
+                        self.card_color()
                     })
                     .stroke(egui::Stroke::new(
                         if selected { 1.5 } else { 1.0 },
                         if selected {
-                            ACCENT
+                            self.accent_color()
                         } else {
                             Color32::from_rgb(50, 55, 64)
                         },
                     ))
-                    .corner_radius(10.0)
+                    .corner_radius(self.config.appearance.corner_radius)
                     .inner_margin(18.0)
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
@@ -1942,7 +2072,7 @@ impl Ferrite {
         self.account_section(ui);
         ui.add_space(20.0);
         ui.horizontal(|ui| {
-            for tab in ["Global", "Launcher", "Appearance"] {
+            for tab in ["Global", "Launcher", "Appearance", "Advanced"] {
                 if ui
                     .selectable_label(self.current_settings_tab == tab, tab)
                     .clicked()
@@ -1957,22 +2087,61 @@ impl Ferrite {
         match self.current_settings_tab.as_str() {
             "Global" => {
                 ui.heading("Global settings");
+                ui.label("Minecraft memory");
+                let changed = ui
+                    .add(
+                        egui::Slider::new(
+                            &mut self.config.minecraft.default_memory_mb,
+                            512..=32_768,
+                        )
+                        .step_by(256.0)
+                        .suffix(" MB"),
+                    )
+                    .changed();
+                ui.label("Applied to the next Minecraft launch.");
+                ui.separator();
                 ui.checkbox(&mut self.is_global_checked, "Enable global defaults");
+                if changed {
+                    self.save_config_change("Saved default Minecraft memory.");
+                }
             }
             "Launcher" => {
                 ui.heading("Launcher settings");
-                ui.checkbox(
-                    &mut self.is_launcher_checked,
-                    "Keep launcher open while playing",
-                );
-                let mut discord_enabled = self.discord_enabled;
+                let mut changed = false;
+                let mut keep_open = !self.config.launcher.close_on_launch;
+                if ui
+                    .checkbox(&mut keep_open, "Keep launcher open while playing")
+                    .changed()
+                {
+                    self.config.launcher.close_on_launch = !keep_open;
+                    changed = true;
+                }
+                changed |= ui
+                    .checkbox(
+                        &mut self.config.launcher.show_snapshots,
+                        "Show Minecraft snapshots",
+                    )
+                    .changed();
+                ui.label("Snapshot visibility is refreshed when Ferrite restarts.");
+                changed |= ui
+                    .checkbox(
+                        &mut self.config.launcher.check_for_updates,
+                        "Check for launcher updates",
+                    )
+                    .changed();
+                if changed {
+                    self.save_config_change("Saved launcher settings.");
+                }
+
+                ui.separator();
+                let mut discord_enabled = self.config.discord.rich_presence;
                 if ui
                     .checkbox(&mut discord_enabled, "Enable Discord Rich Presence")
                     .changed()
                 {
                     self.set_discord_enabled(discord_enabled);
                 }
-                if self.discord_enabled && self.discord.is_none() {
+                if self.config.discord.rich_presence && self.discord.is_none() {
                     ui.label(
                         RichText::new(
                             "Enabled, but Discord is not currently available. Toggle off and on to retry.",
@@ -1981,13 +2150,104 @@ impl Ferrite {
                     );
                 }
             }
-            _ => {
+            "Appearance" => {
                 ui.heading("Appearance");
+                let mut changed = false;
+                let previous_theme = self.config.appearance.theme.clone();
+                egui::ComboBox::from_label("Theme")
+                    .selected_text(capitalize(&self.config.appearance.theme))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.config.appearance.theme,
+                            "dark".to_owned(),
+                            "Dark",
+                        );
+                        ui.selectable_value(
+                            &mut self.config.appearance.theme,
+                            "light".to_owned(),
+                            "Light",
+                        );
+                    });
+                changed |= previous_theme != self.config.appearance.theme;
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.config.appearance.font_scale, 0.5..=2.0)
+                            .step_by(0.05)
+                            .text("Font scale"),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.config.appearance.corner_radius, 0..=32)
+                            .text("Corner radius"),
+                    )
+                    .changed();
+
+                ui.label("Accent color");
+                ui.horizontal(|ui| {
+                    let mut color = self.accent_color();
+                    if ui.color_edit_button_srgba(&mut color).changed() {
+                        self.config.appearance.accent = color_to_hex(color);
+                        self.accent_edit = self.config.appearance.accent.clone();
+                        changed = true;
+                    }
+                    ui.text_edit_singleline(&mut self.accent_edit);
+                    if ui.button("Apply color").clicked() {
+                        if let Some(color) = parse_hex_color(self.accent_edit.trim()) {
+                            self.config.appearance.accent = color_to_hex(color);
+                            self.accent_edit = self.config.appearance.accent.clone();
+                            changed = true;
+                        } else {
+                            self.config_status = Some("Accent must use #RRGGBB format.".to_owned());
+                        }
+                    }
+                });
+                ui.separator();
                 ui.checkbox(
                     &mut self.is_appearance_checked,
                     "Use compact instance cards",
                 );
+                if changed {
+                    self.save_config_change("Saved appearance settings.");
+                }
             }
+            "Advanced" => {
+                ui.heading("Advanced configuration");
+                ui.horizontal(|ui| {
+                    if ui.button("Open Config Folder").clicked() {
+                        self.config_status = Some(match crate::config::open_config_folder() {
+                            Ok(()) => "Opened the config folder.".to_owned(),
+                            Err(error) => format!("Could not open config folder: {error}"),
+                        });
+                    }
+                    if ui.button("Reload Config").clicked() {
+                        self.reload_config();
+                    }
+                });
+                if let Ok(path) = crate::config::config_path() {
+                    ui.label(
+                        RichText::new(path.display().to_string())
+                            .small()
+                            .color(MUTED),
+                    );
+                }
+                ui.label("Raw TOML is only parsed and saved when Apply / Save is pressed.");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.raw_config_toml)
+                        .code_editor()
+                        .desired_rows(18)
+                        .desired_width(f32::INFINITY),
+                );
+                if ui.button("Apply / Save").clicked() {
+                    self.apply_raw_config();
+                }
+            }
+            _ => {}
+        }
+
+        if let Some(status) = &self.config_status {
+            ui.add_space(8.0);
+            ui.label(status);
         }
     }
 
@@ -2043,7 +2303,7 @@ impl Ferrite {
                     import_requested = ui
                         .add_enabled(
                             !self.pack_path.trim().is_empty(),
-                            egui::Button::new("Import and install").fill(ACCENT),
+                            egui::Button::new("Import and install").fill(self.accent_color()),
                         )
                         .clicked();
                 });
@@ -2128,7 +2388,7 @@ impl Ferrite {
                         .add_enabled(
                             !self.pack_path.trim().is_empty()
                                 && self.pack_format != PackFormat::Lunar,
-                            egui::Button::new("Export instance").fill(ACCENT),
+                            egui::Button::new("Export instance").fill(self.accent_color()),
                         )
                         .clicked();
                 });
@@ -2190,7 +2450,7 @@ impl Ferrite {
                     create_requested = ui
                         .add_enabled(
                             !self.instance_name.trim().is_empty(),
-                            egui::Button::new("Create instance").fill(ACCENT),
+                            egui::Button::new("Create instance").fill(self.accent_color()),
                         )
                         .clicked();
                 });
@@ -2211,10 +2471,20 @@ impl eframe::App for Ferrite {
         self.poll_pack_task();
         self.poll_mod_task();
         self.poll_auth();
-        ui.style_mut().visuals = egui::Visuals::dark();
-        ui.style_mut().visuals.panel_fill = BACKGROUND;
+        ui.ctx()
+            .set_zoom_factor(self.config.appearance.font_scale.clamp(0.5, 2.0));
+        let mut visuals = if self.config.appearance.theme == "light" {
+            egui::Visuals::light()
+        } else {
+            egui::Visuals::dark()
+        };
+        let background = self.background_color();
+        let sidebar = self.sidebar_color();
+        visuals.panel_fill = background;
+        visuals.selection.bg_fill = self.accent_color();
+        ui.style_mut().visuals = visuals;
         ui.style_mut().spacing.item_spacing = egui::vec2(10.0, 10.0);
-        ui.painter().rect_filled(ui.max_rect(), 0.0, BACKGROUND);
+        ui.painter().rect_filled(ui.max_rect(), 0.0, background);
 
         // This eframe integration gives `App::ui` an existing root `Ui`, so
         // the sidebar and content area are composed horizontally inside it.
@@ -2228,7 +2498,7 @@ impl eframe::App for Ferrite {
 
         ui.horizontal_top(|ui| {
             egui::Frame::new()
-                .fill(SIDEBAR)
+                .fill(sidebar)
                 .inner_margin(18.0)
                 .show(ui, |ui| {
                     ui.set_width((sidebar_width - 36.0).max(0.0));
@@ -2241,7 +2511,7 @@ impl eframe::App for Ferrite {
                 });
 
             egui::Frame::new()
-                .fill(BACKGROUND)
+                .fill(background)
                 .inner_margin(egui::Margin::same(32))
                 .show(ui, |ui| {
                     ui.set_width(content_width);
@@ -2290,6 +2560,10 @@ impl eframe::App for Ferrite {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         } else if self.auth.account.is_some() {
             ui.ctx().request_repaint_after(Duration::from_secs(1));
+        }
+
+        if std::mem::take(&mut self.close_requested) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 }
@@ -2348,6 +2622,29 @@ fn format_downloads(downloads: u64) -> String {
     }
 }
 
+fn parse_hex_color(value: &str) -> Option<Color32> {
+    let hex = value.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let red = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let green = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let blue = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(Color32::from_rgb(red, green, blue))
+}
+
+fn color_to_hex(color: Color32) -> String {
+    format!("#{:02x}{:02x}{:02x}", color.r(), color.g(), color.b())
+}
+
+fn capitalize(value: &str) -> String {
+    let mut characters = value.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2355,13 +2652,17 @@ mod tests {
     /// Avoids the startup network request while testing UI state transitions.
     fn app() -> Ferrite {
         Ferrite {
+            config: Config::default(),
+            raw_config_toml: crate::config::to_toml(&Config::default()).unwrap(),
+            config_status: None,
+            accent_edit: "#ff6600".into(),
+            close_requested: false,
             auth: AccountSession::default(),
             icons: IconCache::default(),
             running_text: String::new(),
             current_page: Page::Mods,
             current_settings_tab: "Global".into(),
             is_global_checked: false,
-            is_launcher_checked: false,
             is_appearance_checked: false,
             create_instance_open: false,
             instance_name: String::new(),
@@ -2393,9 +2694,16 @@ mod tests {
             show_installed: false,
             pending_uninstall: None,
             mod_task: None,
-            discord_enabled: false,
             discord: None,
         }
+    }
+
+    #[test]
+    fn appearance_color_helpers_validate_and_round_trip() {
+        let color = parse_hex_color("#ff6600").unwrap();
+        assert_eq!(color_to_hex(color), "#ff6600");
+        assert!(parse_hex_color("orange").is_none());
+        assert!(parse_hex_color("#12345").is_none());
     }
 
     /// Installs a fake worker channel without contacting Microsoft.

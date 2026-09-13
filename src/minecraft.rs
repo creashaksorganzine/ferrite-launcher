@@ -164,13 +164,18 @@ pub type Result<T> = std::result::Result<T, FerriteError>;
 /// this again later is cheap and effectively "verifies/repairs" the
 /// install. Multiple versions can coexist under `minecraft/versions/`.
 pub fn get_versions() -> Result<Vec<String>> {
+    get_versions_with_snapshots(false)
+}
+
+/// Fetches selectable Minecraft versions, optionally including Mojang snapshots.
+pub fn get_versions_with_snapshots(show_snapshots: bool) -> Result<Vec<String>> {
     let client = Client::new();
     let manifest = fetch_manifest(&client)?;
 
     Ok(manifest
         .versions
         .into_iter()
-        .filter(|version| version.version_type == "release")
+        .filter(|version| show_snapshots || version.version_type == "release")
         .map(|version| version.id)
         .collect())
 }
@@ -265,7 +270,22 @@ pub fn launch_version(version: &str) -> Result<()> {
 /// Authentication, Java checks, and the single-running-process limit are the
 /// same as in `launch_version`; this does not install or copy game content.
 pub fn launch_version_in_directory(version: &str, game_dir: &Path) -> Result<()> {
-    launch_with_auth(version, game_dir, offline_auth_placeholders(), true)
+    launch_with_auth(version, game_dir, offline_auth_placeholders(), true, None)
+}
+
+/// Offline launch using an explicit maximum Java heap size.
+pub fn launch_version_in_directory_with_memory(
+    version: &str,
+    game_dir: &Path,
+    memory_mb: u32,
+) -> Result<()> {
+    launch_with_auth(
+        version,
+        game_dir,
+        offline_auth_placeholders(),
+        true,
+        Some(memory_mb),
+    )
 }
 
 /// Launches an installed vanilla or synthetic loader version with a Microsoft
@@ -288,7 +308,28 @@ pub fn launch_authenticated(
         &account.xuid,
         "msa",
     );
-    launch_with_auth(version, game_dir, placeholders, false)
+    launch_with_auth(version, game_dir, placeholders, false, None)
+}
+
+/// Authenticated launch using an explicit maximum Java heap size.
+pub fn launch_authenticated_with_memory(
+    version: &str,
+    game_dir: &Path,
+    account: &crate::auth::Account,
+    memory_mb: u32,
+) -> Result<()> {
+    if account.is_expired() {
+        return Err(FerriteError::AuthenticationExpired);
+    }
+    let placeholders = auth_placeholders(
+        &account.name,
+        &account.uuid,
+        &account.access_token,
+        &account.client_id,
+        &account.xuid,
+        "msa",
+    );
+    launch_with_auth(version, game_dir, placeholders, false, Some(memory_mb))
 }
 
 fn launch_with_auth(
@@ -296,6 +337,7 @@ fn launch_with_auth(
     game_dir: &Path,
     mut placeholders: HashMap<String, String>,
     offline: bool,
+    memory_mb: Option<u32>,
 ) -> Result<()> {
     if is_running() {
         return Err(FerriteError::AlreadyRunning);
@@ -401,7 +443,7 @@ fn launch_with_auth(
         abs(&legacy_assets_root)?.to_string_lossy().to_string(),
     );
 
-    let mut command = game_command(&metadata, placeholders, game_dir)?;
+    let mut command = game_command(&metadata, placeholders, game_dir, memory_mb)?;
 
     // Never log the command, resolved arguments, or placeholders: both modern
     // access tokens and legacy sessions contain credentials (including JVM args).
@@ -418,6 +460,7 @@ fn game_command(
     metadata: &VersionMetadata,
     mut placeholders: HashMap<String, String>,
     game_dir: &Path,
+    memory_mb: Option<u32>,
 ) -> Result<Command> {
     fs::create_dir_all(game_dir)?;
     let game_dir = abs(game_dir)?;
@@ -426,6 +469,9 @@ fn game_command(
         game_dir.to_string_lossy().to_string(),
     );
     let mut command = Command::new("java");
+    if let Some(memory_mb) = memory_mb {
+        command.arg(format!("-Xmx{memory_mb}M"));
+    }
     command
         .args(resolve_launch_arguments(metadata, &placeholders))
         .current_dir(game_dir);
@@ -1252,7 +1298,7 @@ mod tests {
             "/shared/libraries/client.jar".to_string(),
         );
 
-        let command = game_command(&metadata, placeholders, &game_dir).unwrap();
+        let command = game_command(&metadata, placeholders, &game_dir, Some(6144)).unwrap();
         let canonical_game_dir = fs::canonicalize(&game_dir).unwrap();
         let args: Vec<String> = command
             .get_args()
@@ -1266,6 +1312,7 @@ mod tests {
         assert_eq!(
             args,
             vec![
+                "-Xmx6144M",
                 "-cp",
                 "/shared/libraries/client.jar",
                 "example.Main",

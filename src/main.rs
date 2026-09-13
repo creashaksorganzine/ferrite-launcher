@@ -3,6 +3,7 @@
 
 mod app;
 mod auth;
+mod config;
 mod discord;
 mod icons;
 mod instance_mods;
