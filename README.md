@@ -56,6 +56,8 @@ IM CURRENTLY COOKING NOTHING RIGHT NOW!!!!
 
 ## Contributing
 
-@Ontogaming - Development
-@Claude - I'm basically fucking solo gng
-@AvatarGamingYT - Testing & Feedback
+## Contributing
+
+- [@Ontogaming](https://github.com/Ontogaming) - Development
+- [@Claude](https://github.com/claude) - I'm basically fucking solo gng
+- [@AvatarGamingYT](https://github.com/AvatarGamingYT) - Testing & Feedback
