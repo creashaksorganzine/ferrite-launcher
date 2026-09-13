@@ -4,6 +4,7 @@
 //! calls to the Minecraft, mod-loader, and persistent instance backends.
 
 use crate::auth::Account;
+use crate::discord::DiscordPresence;
 use crate::icons::IconCache;
 use crate::instance_mods::InstalledMod;
 use crate::instances::InstanceProfile;
@@ -208,6 +209,9 @@ struct Ferrite {
     mod_task: Option<Receiver<ModTaskResult>>,
     /// Bounded asynchronous icon decoding shared by browser and installed mods.
     icons: IconCache,
+    /// Rich Presence is opted in by default, independently of Discord availability.
+    discord_enabled: bool,
+    discord: Option<DiscordPresence>,
 }
 
 impl Default for Ferrite {
@@ -274,11 +278,33 @@ impl Default for Ferrite {
             show_installed: false,
             pending_uninstall: None,
             mod_task: None,
+            discord_enabled: true,
+            discord: DiscordPresence::new(),
         }
     }
 }
 
 impl Ferrite {
+    /// Connects or disconnects Rich Presence immediately when its setting changes.
+    fn set_discord_enabled(&mut self, enabled: bool) {
+        self.discord_enabled = enabled;
+        if enabled {
+            if self.discord.is_none() {
+                self.discord = DiscordPresence::new();
+            }
+            self.running_text = if self.discord.is_some() {
+                "Discord Rich Presence enabled.".into()
+            } else {
+                "Discord Rich Presence is enabled, but Discord is unavailable.".into()
+            };
+        } else {
+            if let Some(mut presence) = self.discord.take() {
+                presence.clear();
+            }
+            self.running_text = "Discord Rich Presence disabled.".into();
+        }
+    }
+
     /// Starts blocking Microsoft authentication off the UI thread with a fresh channel.
     fn start_sign_in(&mut self) {
         if self.auth.task.is_some() {
@@ -1939,6 +1965,21 @@ impl Ferrite {
                     &mut self.is_launcher_checked,
                     "Keep launcher open while playing",
                 );
+                let mut discord_enabled = self.discord_enabled;
+                if ui
+                    .checkbox(&mut discord_enabled, "Enable Discord Rich Presence")
+                    .changed()
+                {
+                    self.set_discord_enabled(discord_enabled);
+                }
+                if self.discord_enabled && self.discord.is_none() {
+                    ui.label(
+                        RichText::new(
+                            "Enabled, but Discord is not currently available. Toggle off and on to retry.",
+                        )
+                        .color(MUTED),
+                    );
+                }
             }
             _ => {
                 ui.heading("Appearance");
@@ -2352,6 +2393,8 @@ mod tests {
             show_installed: false,
             pending_uninstall: None,
             mod_task: None,
+            discord_enabled: false,
+            discord: None,
         }
     }
 
