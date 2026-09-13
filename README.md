@@ -4,7 +4,9 @@ Ferrite is a lightweight Minecraft launcher written in Rust.
 
 ## Why Ferrite?
 
-<!-- explain why you started it -->
+I started Ferrite because I felt that most minecraft launchers didn't work for me
+I also didn't wanna just make a fork of prism (That's the launcher I usually use)
+I also just want everything to be toggle able and I mean EVERYTHING
 
 ## Features
 
