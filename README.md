@@ -89,6 +89,7 @@ target/release/
 ## Contributors
 
 - [@Ontogameing](https://github.com/Ontogameing) - Development
+- [@Claude](https://github.com/claude) - I'm basically fucking solo gng
 - [@AvatarGamingYT](https://github.com/AvatarGamingYT) - Testing & Feedback
 
 ## Contributing
