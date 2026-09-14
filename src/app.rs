@@ -2266,8 +2266,29 @@ impl Ferrite {
                 ui.label("Archive contents are validated and staged before the instance is committed.");
                 ui.add_space(8.0);
                 ui.add_enabled_ui(!self.pack_busy(), |ui| {
-                    ui.label("Archive path");
-                    ui.text_edit_singleline(&mut self.pack_path);
+                    ui.label("Pack archive");
+                    ui.horizontal(|ui| {
+                        if ui.button("Choose Pack File…").clicked()
+                            && let Some(path) = rfd::FileDialog::new()
+                                .set_title("Choose a Minecraft instance pack")
+                                .add_filter(
+                                    "Minecraft instance packs",
+                                    &["ferritepack", "mrpack", "zip", "lcpack"],
+                                )
+                                .pick_file()
+                        {
+                            self.pack_path = path.display().to_string();
+                            self.pack_status = None;
+                        }
+                        if !self.pack_path.is_empty() && ui.button("Clear").clicked() {
+                            self.pack_path.clear();
+                        }
+                    });
+                    if self.pack_path.is_empty() {
+                        ui.label(RichText::new("No pack selected.").color(MUTED));
+                    } else {
+                        ui.label(RichText::new(&self.pack_path).monospace());
+                    }
                     ui.label("Instance name override (optional)");
                     ui.text_edit_singleline(&mut self.pack_name);
                     ui.separator();

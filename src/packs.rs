@@ -84,7 +84,6 @@ pub struct ArchiveLimits {
     pub max_entries: usize,
     pub max_file_bytes: u64,
     pub max_total_bytes: u64,
-    pub max_compression_ratio: u64,
 }
 
 impl Default for ArchiveLimits {
@@ -92,8 +91,8 @@ impl Default for ArchiveLimits {
         Self {
             max_entries: 100_000,
             max_file_bytes: 2 * 1024 * 1024 * 1024,
-            max_total_bytes: 8 * 1024 * 1024 * 1024,
-            max_compression_ratio: 200,
+            // Large world backups can legitimately expand far beyond their ZIP size.
+            max_total_bytes: 32 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -522,15 +521,7 @@ fn scan_archive(path: &Path, limits: ArchiveLimits) -> Result<ArchiveCatalog> {
                 limits.max_total_bytes
             )));
         }
-        let compressed = entry.compressed_size();
-        if size > 0
-            && (compressed == 0 || size > compressed.saturating_mul(limits.max_compression_ratio))
-        {
-            return Err(PackError::Limit(format!(
-                "entry {name:?} exceeds compression ratio {}:1",
-                limits.max_compression_ratio
-            )));
-        }
+
         entries.push(EntryMeta {
             index,
             name: name.clone(),
@@ -1942,6 +1933,23 @@ mod tests {
             b"enabled=true"
         );
         assert!(!destination.join("saves").exists());
+    }
+
+    #[test]
+    fn highly_compressible_minecraft_files_are_allowed() {
+        let temp = TempDir::new("compressible");
+        let pack = temp.0.join("world.zip");
+        let file = File::create(&pack).unwrap();
+        let mut zip = ZipWriter::new(file);
+        zip.start_file(
+            "minecraft/saves/city/entities/r.-3.1.mca",
+            FileOptions::default().compression_method(CompressionMethod::Deflated),
+        )
+        .unwrap();
+        zip.write_all(&vec![0; 1024 * 1024]).unwrap();
+        zip.finish().unwrap();
+
+        assert_eq!(inspect(pack).unwrap().format, PackFormat::GenericZip);
     }
 
     #[test]
