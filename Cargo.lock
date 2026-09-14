@@ -1264,6 +1264,7 @@ dependencies = [
  "image",
  "reqwest",
  "rfd",
+ "semver",
  "serde",
  "serde_json",
  "sha1",

@@ -12,6 +12,7 @@ use crate::instances::InstanceProfile;
 use crate::loaders::ModLoader;
 use crate::modrinth::{ProjectDetails, SearchFilters, SearchResponse};
 use crate::packs::{ExportOptions, ImportOptions, PackFormat, PackTarget};
+use crate::updates::{UpdateCheck, UpdateInfo};
 use eframe::egui::{self, Color32, RichText};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -157,6 +158,11 @@ struct Ferrite {
     config_status: Option<String>,
     accent_edit: String,
     close_requested: bool,
+    /// One non-blocking GitHub release check and its session-only notification state.
+    update_task: Option<Receiver<(bool, Result<UpdateCheck, String>)>>,
+    update_info: Option<UpdateInfo>,
+    update_status: Option<String>,
+    update_dismissed: bool,
     /// Session credentials and a worker cancelled automatically when the app drops.
     auth: AccountSession,
     /// A short result/status message displayed at the bottom of the window.
@@ -263,12 +269,16 @@ impl Default for Ferrite {
         }
         let selected_instance = (!instances.is_empty()).then_some(0);
 
-        Self {
+        let mut app = Self {
             config,
             raw_config_toml,
             config_status: None,
             accent_edit,
             close_requested: false,
+            update_task: None,
+            update_info: None,
+            update_status: None,
+            update_dismissed: false,
             auth: AccountSession {
                 client_id: std::env::var("FERRITE_MICROSOFT_CLIENT_ID").unwrap_or_default(),
                 ..Default::default()
@@ -313,11 +323,114 @@ impl Default for Ferrite {
             pending_uninstall: None,
             mod_task: None,
             discord,
+        };
+        if app.config.launcher.check_for_updates {
+            app.start_update_check(false);
         }
+        app
     }
 }
 
 impl Ferrite {
+    fn start_update_check(&mut self, manual: bool) {
+        if self.update_task.is_some() {
+            if manual {
+                self.update_status = Some("An update check is already running.".into());
+            }
+            return;
+        }
+        self.update_status = Some("Checking for updates...".into());
+        let (sender, receiver) = mpsc::channel();
+        match std::thread::Builder::new()
+            .name("github-update-check".to_owned())
+            .spawn(move || {
+                let result = crate::updates::check_for_update().map_err(|error| error.to_string());
+                let _ = sender.send((manual, result));
+            }) {
+            Ok(_) => self.update_task = Some(receiver),
+            Err(error) => {
+                self.update_status = Some(format!("Could not start update check: {error}"));
+            }
+        }
+    }
+
+    fn poll_update_check(&mut self) {
+        let Some(receiver) = &self.update_task else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok((_manual, Ok(UpdateCheck::Available(info)))) => {
+                self.update_status = Some(format!(
+                    "Update available: {} → {}",
+                    info.current_version, info.latest_version
+                ));
+                self.update_info = Some(info);
+                self.update_dismissed = false;
+                self.update_task = None;
+            }
+            Ok((
+                _manual,
+                Ok(UpdateCheck::UpToDate {
+                    current_version,
+                    latest_version,
+                }),
+            )) => {
+                self.update_status = Some(format!(
+                    "Ferrite is up to date ({current_version}; latest release {latest_version})."
+                ));
+                self.update_info = None;
+                self.update_task = None;
+            }
+            Ok((_manual, Err(error))) => {
+                self.update_status = Some(format!("Could not check for updates: {error}"));
+                self.update_task = None;
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.update_status = Some("Could not check for updates: worker stopped.".into());
+                self.update_task = None;
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    fn update_banner(&mut self, ui: &mut egui::Ui) {
+        if self.update_dismissed {
+            return;
+        }
+        let Some(info) = self.update_info.as_ref() else {
+            return;
+        };
+        let current = info.current_version.to_string();
+        let latest = info.latest_version.to_string();
+        let release_url = info.release_url.clone();
+        let release_name = info.release_name.clone();
+        egui::Frame::new()
+            .fill(self.card_color())
+            .stroke(egui::Stroke::new(1.0, self.accent_color()))
+            .corner_radius(self.config.appearance.corner_radius)
+            .inner_margin(12.0)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new("Update Available")
+                            .strong()
+                            .color(self.accent_color()),
+                    );
+                    ui.label(format!("Current {current} · Latest {latest}"));
+                    if let Some(name) = release_name {
+                        ui.label(format!("· {name}"));
+                    }
+                    if ui.button("Open Release").clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(release_url));
+                    }
+                    if ui.button("Dismiss").clicked() {
+                        self.update_dismissed = true;
+                    }
+                });
+            });
+        ui.add_space(8.0);
+    }
+
     fn sync_discord_presence(&mut self) {
         if self.config.discord.rich_presence {
             if self.discord.is_none() {
@@ -2126,11 +2239,27 @@ impl Ferrite {
                 changed |= ui
                     .checkbox(
                         &mut self.config.launcher.check_for_updates,
-                        "Check for launcher updates",
+                        "Check for launcher updates automatically",
                     )
                     .changed();
                 if changed {
                     self.save_config_change("Saved launcher settings.");
+                }
+                if ui
+                    .add_enabled(
+                        self.update_task.is_none(),
+                        egui::Button::new(if self.update_task.is_some() {
+                            "Checking..."
+                        } else {
+                            "Check for Updates"
+                        }),
+                    )
+                    .clicked()
+                {
+                    self.start_update_check(true);
+                }
+                if let Some(status) = &self.update_status {
+                    ui.label(status);
                 }
 
                 ui.separator();
@@ -2492,6 +2621,7 @@ impl eframe::App for Ferrite {
         self.poll_pack_task();
         self.poll_mod_task();
         self.poll_auth();
+        self.poll_update_check();
         ui.ctx()
             .set_zoom_factor(self.config.appearance.font_scale.clamp(0.5, 2.0));
         let mut visuals = if self.config.appearance.theme == "light" {
@@ -2539,10 +2669,11 @@ impl eframe::App for Ferrite {
                     ui.set_min_height(content_height);
 
                     ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                        self.update_banner(ui);
                         // Reserve a fixed footer and give the page the remaining
                         // height. Scrollable pages now receive the right dimensions
                         // on the first frame instead of after a resize.
-                        let page_height = (content_height - 38.0).max(0.0);
+                        let page_height = (ui.available_height() - 38.0).max(0.0);
                         ui.allocate_ui_with_layout(
                             egui::vec2(content_width, page_height),
                             egui::Layout::top_down(egui::Align::LEFT),
@@ -2577,6 +2708,7 @@ impl eframe::App for Ferrite {
             || self.pack_task.is_some()
             || self.mod_task.is_some()
             || self.auth.task.is_some()
+            || self.update_task.is_some()
         {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         } else if self.auth.account.is_some() {
@@ -2678,6 +2810,10 @@ mod tests {
             config_status: None,
             accent_edit: "#ff6600".into(),
             close_requested: false,
+            update_task: None,
+            update_info: None,
+            update_status: None,
+            update_dismissed: false,
             auth: AccountSession::default(),
             icons: IconCache::default(),
             running_text: String::new(),
@@ -2717,6 +2853,36 @@ mod tests {
             mod_task: None,
             discord: None,
         }
+    }
+
+    #[test]
+    fn update_results_are_polled_without_networking() {
+        let mut app = app();
+        let (sender, receiver) = mpsc::channel();
+        app.update_task = Some(receiver);
+        sender
+            .send((
+                true,
+                Ok(UpdateCheck::Available(UpdateInfo {
+                    current_version: semver::Version::parse("0.1.0-alpha").unwrap(),
+                    latest_version: semver::Version::parse("0.1.0").unwrap(),
+                    release_url: "https://github.com/Ontogameing/ferrite-launcher/releases/tag/v0.1.0".into(),
+                    release_name: Some("Ferrite 0.1.0".into()),
+                })),
+            ))
+            .unwrap();
+        app.poll_update_check();
+        assert!(app.update_task.is_none());
+        assert_eq!(
+            app.update_info.as_ref().unwrap().latest_version,
+            semver::Version::new(0, 1, 0)
+        );
+        assert!(
+            app.update_status
+                .as_deref()
+                .unwrap()
+                .contains("Update available")
+        );
     }
 
     #[test]
