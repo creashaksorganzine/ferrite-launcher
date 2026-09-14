@@ -71,6 +71,6 @@ jobs:
                   prerelease: ${{ contains(github.ref_name, '-') }}
                   generate_release_notes: true
                   files: |
-                      artifacts/ferrite-launcher-linux/ferrite-launcher
-                      artifacts/ferrite-launcher-windows/ferrite-launcher.exe
-                      artifacts/ferrite-launcher-macos/ferrite-launcher
+                      artifacts/ferrite-launcher-linux/ferrite-launcher-linux
+                      artifacts/ferrite-launcher-windows/ferrite-launcher-windows.exe
+                      artifacts/ferrite-launcher-macos/ferrite-launcher-macos
