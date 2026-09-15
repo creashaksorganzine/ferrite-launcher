@@ -16,7 +16,6 @@ I also fucking hate when launchers don't let you customize the UI (when Feather 
 
 - Launch Minecraft (obviously)
 - Install Minecraft mod loaders
-  <<<<<<< HEAD
     - Fabric
     - Forge
     - NeoForge
