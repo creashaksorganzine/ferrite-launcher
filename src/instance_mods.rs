@@ -1,17 +1,32 @@
-//! Local installed-mod management; no network access or jar execution.
+//! Inspection and safe local mutation of installed mod JARs.
 //!
-//! All operations are scoped to `game_dir/mods`. Missing directories list as empty;
-//! mutations require an existing regular jar. Filenames are exact, case-sensitive
-//! basenames ending in `.jar` or `.jar.disabled`. Symlinks (including directory
-//! ancestors) are rejected, and listing ignores non-regular/unsupported entries.
-//! Malformed or unrecognized metadata falls back to the filename without its suffix.
+//! This module performs no network access and never loads or executes JAR code.
+//! Operations are confined to an instance's `game_dir/mods` directory. Listing a
+//! missing directory yields an empty collection, while mutation requires an exact,
+//! existing regular file whose case-sensitive basename ends in `.jar` or
+//! `.jar.disabled`. Unsupported entries and symlinks are ignored while listing and
+//! rejected for mutation; every existing directory component is also checked to
+//! reject symlinked ancestors.
 //!
-//! Enable/disable uses hard-link-then-unlink, so an existing destination is never
-//! overwritten, even if created concurrently. This requires hard-link support and
-//! is not an atomic rename: a crash/unlink failure can leave both names present.
-//! Callers must serialize mutations and prevent concurrent replacement of directory
-//! components/files: portable std filesystem checks are not a security boundary
-//! against an attacker concurrently modifying the instance directory.
+//! Display metadata is best-effort and untrusted. The reader recognizes Fabric,
+//! Quilt, and legacy Forge JSON descriptors inside the ZIP, applies strict read
+//! limits, and never extracts archive entries. Invalid archives, malformed or
+//! unsupported descriptors, unsafe icon paths, and oversized metadata degrade to
+//! the filename-derived name with no version/icon rather than making listing fail.
+//! Filesystem enumeration/inspection errors are still returned because they make
+//! the directory result unreliable.
+//!
+//! Enabling and disabling changes only the suffix. It creates a hard link under
+//! the destination name before unlinking the source, so a destination that already
+//! exists is never overwritten, including when it appears concurrently. The tradeoff
+//! is that hard links must be supported and the two-step operation is not atomic:
+//! a crash or unlink failure can leave both names. Uninstall likewise removes only
+//! the exact validated regular file; it does not infer or delete related files.
+//!
+//! These checks defend against accidental traversal and ordinary symlink mistakes,
+//! not a hostile process racing filesystem components between checks and use.
+//! Callers must serialize mutations and control the instance tree if it is a trust
+//! boundary.
 //!
 //! Integration: declare `mod instance_mods;` in the consuming crate. Unit tests
 //! below use only temporary directories and synthetic jars, and run offline with
@@ -23,21 +38,37 @@ use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use zip::ZipArchive;
 
+// Bounds apply to uncompressed ZIP entry sizes and to bytes actually read.
 const METADATA_LIMIT: u64 = 256 * 1024;
 const ICON_LIMIT: u64 = 1024 * 1024;
 
+/// UI-facing description of one regular mod JAR found on disk.
+///
+/// Identity and mutations use [`Self::filename`], never the untrusted embedded
+/// display fields. Metadata fields remain useful even when partial: each absent
+/// value independently falls back or stays `None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledMod {
     /// Exact on-disk basename, including `.disabled` when disabled.
     pub filename: String,
+    /// Embedded display name, or the filename stem when no valid name was found.
     pub name: String,
+    /// Embedded mod version when the recognized descriptor supplies one.
     pub version: Option<String>,
+    /// Whether the exact filename has the active `.jar` suffix.
     pub enabled: bool,
-    /// Untrusted image data, at most 1 MiB. Consumers must decode defensively.
+    /// Untrusted encoded image data, at most 1 MiB.
+    ///
+    /// Consumers must still validate dimensions, format, and decoder allocation.
     pub icon: Option<Vec<u8>>,
 }
 
-/// List regular jars in deterministic filename order. Bad jar metadata is ignored.
+/// Lists regular mod JARs in deterministic filename order.
+///
+/// Each candidate starts with filename-derived metadata, then recognized embedded
+/// descriptors may replace its name and add a version/icon. Per-JAR archive and
+/// descriptor errors preserve that fallback and do not abort the scan. Directory
+/// access or entry-inspection errors are returned with the affected path.
 pub fn list(game_dir: impl AsRef<Path>) -> Result<Vec<InstalledMod>, String> {
     let Some(mods) = mods_directory(game_dir.as_ref())? else {
         return Ok(Vec::new());
@@ -71,9 +102,13 @@ pub fn list(game_dir: impl AsRef<Path>) -> Result<Vec<InstalledMod>, String> {
     Ok(result)
 }
 
-/// Enable/disable an exact existing filename; returns its resulting basename.
-/// A request matching the current state is a no-op after validating the source.
-/// An existing destination of any type is an error and is never overwritten.
+/// Enables or disables an exact existing filename and returns its resulting basename.
+///
+/// A request matching the current state is a no-op only after validating that the
+/// source is still a regular file. A state change uses hard-link-then-unlink rather
+/// than rename because rename may replace an existing destination. If unlinking the
+/// source fails, no rollback is attempted: the error identifies that both names may
+/// now refer to the same file.
 pub fn set_enabled(
     game_dir: impl AsRef<Path>,
     filename: &str,
@@ -86,7 +121,7 @@ pub fn set_enabled(
     }
     let target_name = format!("{stem}.jar{}", if enabled { "" } else { ".disabled" });
     let target = source.with_file_name(&target_name);
-    // hard_link fails if target exists, unlike Unix rename which overwrites it.
+    // Establish the non-overwriting destination first; only then retire the old name.
     fs::hard_link(&source, &target).map_err(|e| error("Create mod destination", &target, e))?;
     fs::remove_file(&source).map_err(|e| {
         format!(
@@ -98,7 +133,10 @@ pub fn set_enabled(
     Ok(target_name)
 }
 
-/// Remove only the exact named regular jar; missing files are reported as errors.
+/// Removes only the exact named regular JAR.
+///
+/// Missing files, symlinks, directories, unsafe basenames, and unsupported suffixes
+/// are errors. No alternate enabled/disabled name is searched or removed.
 pub fn uninstall(game_dir: impl AsRef<Path>, filename: &str) -> Result<(), String> {
     let path = existing_mod(game_dir.as_ref(), filename)?;
     fs::remove_file(&path).map_err(|e| error("Uninstall", &path, e))
@@ -108,6 +146,10 @@ fn error(action: &str, path: &Path, error: io::Error) -> String {
     format!("{action} {}: {error}", path.display())
 }
 
+/// Validates a caller-controlled basename and derives its stem and enabled state.
+///
+/// Requiring exactly one normal path component prevents traversal or absolute paths;
+/// explicit separator/control checks keep behavior consistent across platforms.
 fn parse_filename(filename: &str) -> Result<(&str, bool), String> {
     if filename.is_empty()
         || filename
@@ -131,6 +173,12 @@ fn parse_filename(filename: &str) -> Result<(&str, bool), String> {
     }
 }
 
+/// Resolves `game_dir/mods` while rejecting traversal and non-directory ancestors.
+///
+/// Relative paths are anchored to the current working directory so every component
+/// can be inspected from a concrete root. `symlink_metadata` deliberately observes
+/// links themselves instead of following them. The first missing component means the
+/// mods directory is absent; callers decide whether absence is empty or an error.
 fn mods_directory(game_dir: &Path) -> Result<Option<PathBuf>, String> {
     let path = if game_dir.is_absolute() {
         game_dir.to_owned()
@@ -140,7 +188,7 @@ fn mods_directory(game_dir: &Path) -> Result<Option<PathBuf>, String> {
             .join(game_dir)
     }
     .join("mods");
-    // Reject parent traversal before inspecting anything, even after a missing component.
+    // Validate the whole lexical path before an early return on a missing component.
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err("Game directory must not contain parent traversal".into());
     }
@@ -162,6 +210,10 @@ fn mods_directory(game_dir: &Path) -> Result<Option<PathBuf>, String> {
     Ok(Some(path))
 }
 
+/// Returns the path only when both its directory chain and leaf type are acceptable.
+///
+/// This check does not open or lock the file, so callers still rely on exclusive
+/// control of the instance directory between validation and mutation.
 fn existing_mod(game_dir: &Path, filename: &str) -> Result<PathBuf, String> {
     parse_filename(filename)?;
     let mods = mods_directory(game_dir)?.ok_or("Mods directory does not exist")?;
@@ -183,6 +235,7 @@ fn text(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Accepts only relative, normalized, slash-separated archive entry names.
 fn safe_zip_path(path: &str) -> bool {
     !path.is_empty()
         && !path
@@ -193,6 +246,11 @@ fn safe_zip_path(path: &str) -> bool {
             .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
+/// Reads one regular ZIP entry without extraction and within `limit` bytes.
+///
+/// Both the declared uncompressed size and the streamed result are checked. Reading
+/// one extra byte catches archives whose actual output exceeds their header claim.
+/// Unix mode checks reject entries explicitly marked as links or special files.
 fn zip_bytes(archive: &mut ZipArchive<File>, path: &str, limit: u64) -> Option<Vec<u8>> {
     if !safe_zip_path(path) {
         return None;
@@ -212,6 +270,12 @@ fn zip_bytes(archive: &mut ZipArchive<File>, path: &str, limit: u64) -> Option<V
     (bytes.len() as u64 <= limit).then_some(bytes)
 }
 
+/// Enriches filename-derived metadata from the first useful recognized descriptor.
+///
+/// Descriptor precedence is Fabric, Quilt, then legacy Forge. Their schemas place
+/// fields at different nesting levels, so the selected `details` object normalizes
+/// subsequent name/version/icon handling. A descriptor counts as useful when any
+/// supported field is valid; otherwise scanning continues to the next format.
 fn read_metadata(path: &Path, installed: &mut InstalledMod) {
     let Ok(file) = File::open(path) else { return };
     let Ok(mut archive) = ZipArchive::new(file) else {
@@ -248,7 +312,7 @@ fn read_metadata(path: &Path, installed: &mut InstalledMod) {
         let version = text(version);
         let icon_value = &details[icon_key];
         let icon_path = text(icon_value).or_else(|| {
-            // Fabric's size-keyed icon map: prefer the largest declared size.
+            // Fabric may map nominal pixel sizes to paths; choose the largest valid key.
             icon_value
                 .as_object()?
                 .iter()

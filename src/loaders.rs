@@ -2,8 +2,16 @@
 //!
 //! `app.rs` should call into this module for install/launch instead of
 //! `crate::minecraft` directly, so loader selection lives in one place.
-//! Each loader gets its own submodule; this file just matches on
-//! `ModLoader` and delegates.
+//! Each loader gets its own submodule; this file matches on [`ModLoader`],
+//! delegates installation and local-id discovery, and funnels every launch back
+//! through `crate::minecraft` for argument construction and process management.
+//! Vanilla is the identity case: its launch id is the requested Minecraft id.
+//!
+//! Loader installs share the relative `minecraft/` storage tree with vanilla.
+//! Each loader writes a small marker beside the vanilla version metadata that
+//! records the exact synthetic version id selected at install time. Launch and
+//! status checks are therefore local and deterministic: they do not contact a
+//! loader API or silently switch to a newer published build.
 //!
 //! # How a loader installs (see `fabric.rs` for the concrete example)
 //!
@@ -18,19 +26,16 @@
 //! loader-specific about classpath building, argument resolution, or
 //! process spawning.
 //!
-//! # Adding a new loader (Forge / NeoForge / Quilt)
+//! # Adding another loader
 //!
-//! 1. Add a submodule (`forge.rs`, `neoforge.rs`, `quilt.rs`) exposing
-//!    at minimum:
-//!    - `install(mc_version: &str) -> minecraft::Result<()>`
-//!    - `installed_composite_id(mc_version: &str) -> minecraft::Result<String>`
-//!    following the pattern in `fabric.rs`. Forge/NeoForge installers
-//!    are `.jar`-based rather than a clean metadata API, so that
-//!    submodule will look a fair bit different internally — but the
-//!    *shape* it hands back to `minecraft.rs` (a synthetic version
-//!    directory) should be the same.
-//! 2. Add the variant to `ModLoader` and a match arm in each of
-//!    `install`, `launch`, and `is_installed` below.
+//! A new backend should expose the same operations used by the dispatch functions below:
+//! installation (including an optional exact loader version), discovery of the installed
+//! synthetic Minecraft id, and discovery of the installed loader version. Add the loader
+//! to [`ModLoader`] and route each install, launch, and status function to that backend.
+//!
+//! The backend may consume a metadata API, as Fabric and Quilt do, or normalize the output
+//! of a Java installer, as Forge and NeoForge do. In either case, its durable result must
+//! be the same vanilla-shaped version directory and marker contract expected here.
 
 mod fabric;
 mod forge;
@@ -40,12 +45,21 @@ mod quilt;
 use crate::minecraft::{self, Result};
 use std::path::Path;
 
+/// Loader implementation to install, inspect, or launch.
+///
+/// This value is `Copy`, so dispatch functions take it by value without moving
+/// any heap-owned state from their callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModLoader {
+    /// Unmodified Mojang metadata and client.
     Vanilla,
+    /// Fabric profile metadata layered over vanilla.
     Fabric,
+    /// Forge's client installer output normalized over vanilla.
     Forge,
+    /// NeoForge's client installer output normalized over vanilla.
     NeoForge,
+    /// Quilt profile metadata layered over vanilla.
     Quilt,
 }
 
@@ -72,6 +86,8 @@ impl ModLoader {
         }
     }
 
+    /// Parses the exact, case-sensitive display label used by [`Self::label`].
+    /// Unknown labels return `None` rather than defaulting to vanilla.
     pub fn from_label(label: &str) -> Option<ModLoader> {
         ModLoader::ALL.into_iter().find(|l| l.label() == label)
     }
@@ -92,6 +108,10 @@ pub fn install(mc_version: &str, loader: ModLoader) -> Result<()> {
 }
 
 /// Installs an exact loader version when a pack manifest pins one.
+///
+/// `None` delegates to [`install`] and lets the selected loader discover its
+/// preferred current build. Vanilla ignores a supplied loader version because
+/// Mojang's version id already identifies the complete install.
 pub fn install_version(
     mc_version: &str,
     loader: ModLoader,
@@ -168,6 +188,10 @@ pub fn launch_authenticated_with_memory(
     minecraft::launch_authenticated_with_memory(&version, game_dir, account, memory_mb)
 }
 
+/// Resolves a UI-level `(Minecraft, loader)` choice to the installed version id
+/// understood by `minecraft.rs`. Loader lookup errors propagate to launch; after
+/// lookup, vanilla natives are recopied into the synthetic native directory to
+/// repair missing workdirs before every launch.
 fn prepare_launch_version(mc_version: &str, loader: ModLoader) -> Result<String> {
     let composite_id = match loader {
         ModLoader::Vanilla => return Ok(mc_version.to_string()),
@@ -180,7 +204,11 @@ fn prepare_launch_version(mc_version: &str, loader: ModLoader) -> Result<String>
     Ok(composite_id)
 }
 
-/// Returns `true` if `mc_version` is installed under the given loader.
+/// Returns whether the selected local version has both metadata and `client.jar`.
+///
+/// For loaders, a missing/unreadable marker and any loader-id lookup error are
+/// deliberately collapsed to `false`; this status probe never performs network
+/// I/O and cannot distinguish a partial install from no install.
 pub fn is_installed(mc_version: &str, loader: ModLoader) -> bool {
     match loader {
         ModLoader::Vanilla => minecraft::is_version_installed(mc_version),
@@ -200,7 +228,10 @@ pub fn is_installed(mc_version: &str, loader: ModLoader) -> bool {
 }
 
 /// Reads the exact installed loader version from the synthetic version metadata.
+///
 /// This is used for portable pack manifests and never performs a network request.
+/// Missing markers/files, malformed JSON, absent coordinates, and vanilla all
+/// return `None`; this best-effort query intentionally does not expose errors.
 pub fn installed_loader_version(mc_version: &str, loader: ModLoader) -> Option<String> {
     let composite_id = match loader {
         ModLoader::Vanilla => return None,
@@ -217,6 +248,9 @@ pub fn installed_loader_version(mc_version: &str, loader: ModLoader) -> Option<S
     loader_version_from_metadata(mc_version, loader, &metadata)
 }
 
+/// Finds the first recognized loader Maven coordinate. Classifiers are removed,
+/// and Forge-style versions prefixed with `<minecraft>-` are normalized to the
+/// loader-only version used in portable manifests.
 fn loader_version_from_metadata(
     mc_version: &str,
     loader: ModLoader,

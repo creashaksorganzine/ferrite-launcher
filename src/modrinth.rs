@@ -1,4 +1,11 @@
-//! Blocking Modrinth v2 API; call these functions from a worker thread, not the UI.
+//! Blocking, deliberately small Modrinth v2 API integration.
+//!
+//! The public response types mirror only fields consumed by the launcher. Serde ignores
+//! additional API fields, while `#[serde(default)]` keeps optional/omitted fields from
+//! making otherwise useful responses undecodable. Every network entry point constructs
+//! the same HTTPS-only client and returns display-ready `String` errors with endpoint or
+//! filesystem context. Calls are synchronous, so UI callers must move them to a worker
+//! thread.
 //!
 //! `search` returns the first page (20 hits). `install` selects the first compatible
 //! version in Modrinth's newest-first response, including prereleases, and installs
@@ -37,6 +44,11 @@ const API: &str = "https://api.modrinth.com/v2/";
 const MAX_PROJECTS: usize = 256;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
+/// A compact project record returned by Modrinth's search endpoint.
+///
+/// Unlike [`Project`], this is search-index data rather than authoritative project
+/// metadata. Optional fields may be absent as the API/search index evolves; callers that
+/// need the full description, team, or complete release list should use [`details`].
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SearchHit {
     pub title: String,
@@ -89,6 +101,10 @@ impl Default for SearchFilters {
     }
 }
 
+/// One page of search results plus the server-reported pagination bounds.
+///
+/// `offset` and `limit` describe this response; `total_hits` allows callers to decide
+/// whether requesting a later page through [`search_filtered`] is useful.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SearchResponse {
     pub hits: Vec<SearchHit>,
@@ -110,7 +126,11 @@ pub fn search_filtered(filters: &SearchFilters) -> Result<SearchResponse, String
     Api::new()?.get("search", &filtered_search_params(filters))
 }
 
-/// Full project metadata; `body` is Modrinth's Markdown description.
+/// Full project metadata returned by `/project/{id}`.
+///
+/// `description` is the short summary while `body` is Modrinth's Markdown description.
+/// Loader, game-version, and side fields describe project-level support and do not choose
+/// an installable release; installation performs release-level compatibility checks.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Project {
     pub id: String,
@@ -132,6 +152,11 @@ pub struct Project {
     pub issues_url: Option<String>,
 }
 
+/// Display metadata for a release in the unfiltered project-details version list.
+///
+/// This intentionally omits download-file data used by installation. Dependency entries
+/// are exposed for the details UI only; [`install`] resolves its own fresh internal models
+/// so it can validate pins, files, and compatibility before writing anything.
 #[derive(Debug, Clone, Deserialize)]
 pub struct VersionSummary {
     pub id: String,
@@ -149,6 +174,11 @@ pub struct VersionSummary {
     pub dependencies: Vec<DependencySummary>,
 }
 
+/// Dependency metadata as shown for a release.
+///
+/// Modrinth may identify a dependency by project, exact version, or only a filename.
+/// Presence here does not mean this module will install it: installation follows only
+/// `required` entries and requires a usable project or version identifier.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DependencySummary {
     #[serde(default)]
@@ -160,6 +190,7 @@ pub struct DependencySummary {
     pub dependency_type: String,
 }
 
+/// Public user fields embedded in a Modrinth team-members response.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TeamUser {
     pub id: String,
@@ -170,6 +201,7 @@ pub struct TeamUser {
     pub avatar_url: Option<String>,
 }
 
+/// A project-team membership, including whether the invitation was accepted.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TeamMember {
     pub user: TeamUser,
@@ -177,6 +209,10 @@ pub struct TeamMember {
     pub accepted: bool,
 }
 
+/// Aggregate used by a details view.
+///
+/// Construction is all-or-nothing: [`details`] does not return project data if versions
+/// or team membership could not also be fetched.
 #[derive(Debug, Clone)]
 pub struct ProjectDetails {
     pub project: Project,
@@ -215,6 +251,13 @@ pub fn details(project_id: &str) -> Result<ProjectDetails, String> {
 }
 
 /// Install a mod and its required dependencies under `game_dir/mods`.
+///
+/// `game_dir: impl AsRef<Path>` accepts either an owned path or a borrowed path-like value
+/// without forcing callers to allocate. Resolution finishes before the directory is
+/// created, so metadata/compatibility failures write nothing. Downloads then proceed in
+/// dependency-first order; each file is staged and published independently, so a later
+/// failure does not roll back earlier successful files.
+///
 /// Returns dependency-first paths, including byte-identical files already present.
 /// Errors have context and can be sent directly from a worker thread to the UI.
 pub fn install(
@@ -316,6 +359,9 @@ impl Api {
             .map_err(|e| format!("Build Modrinth client: {e}"))
     }
 
+    // `DeserializeOwned` is required because the decoded value outlives the response
+    // reader; endpoint helpers can therefore request any owned Serde model without
+    // coupling this transport wrapper to a particular API response.
     fn get<T: DeserializeOwned>(
         &self,
         path: &str,
@@ -359,6 +405,10 @@ struct Dependency {
     dependency_type: String,
 }
 
+// Resolution depends only on these two lookups. Keeping that boundary as a trait makes
+// graph ordering, cycles, and pin conflicts testable without weakening the production
+// HTTP validation. Callers use `&impl VersionSource`, so this remains statically
+// dispatched and does not require trait objects or lifetimes on returned releases.
 trait VersionSource {
     fn versions(&self, project: &str, game: &str, loader: &str) -> Result<Vec<Version>, String>;
     fn version(&self, id: &str) -> Result<Version, String>;
@@ -389,6 +439,9 @@ impl VersionSource for Api {
     }
 }
 
+// Compatibility is an exact membership test. There is intentionally no normalization,
+// semantic-version interpretation, or loader aliasing: these values are Modrinth slugs
+// and Minecraft version identifiers supplied to the API.
 fn compatible(release: &Version, game: &str, loader: &str) -> bool {
     release.game_versions.iter().any(|v| v == game) && release.loaders.iter().any(|v| v == loader)
 }
@@ -400,6 +453,9 @@ fn select(
     loader: &str,
 ) -> Result<Version, String> {
     valid_id(project)?;
+    // Modrinth returns project versions newest first. Preserving that order makes the
+    // first exact match the selected release; release type is not used to exclude beta
+    // or alpha versions.
     source
         .versions(project, game, loader)?
         .into_iter()
@@ -414,9 +470,14 @@ fn resolve(
     loader: &str,
 ) -> Result<Vec<Version>, String> {
     let root = select(source, project, game, loader)?;
+    // `selected` is keyed by project rather than version so two exact pins for one
+    // project become a conflict instead of silently installing duplicate releases.
     let mut selected = HashMap::new();
     let mut plan = Vec::new();
     visit(source, root, game, loader, &mut selected, &mut plan)?;
+    // Detect case-insensitive destination collisions before downloading. This is stricter
+    // than some Unix filesystems but keeps plans portable to case-insensitive systems and
+    // prevents one project from occupying another project's intended path.
     let mut filenames = HashMap::new();
     for release in &plan {
         let filename = &primary_file(release)?.filename;
@@ -464,6 +525,9 @@ fn visit(
         if dep.dependency_type != "required" {
             continue;
         }
+        // An exact version pin wins over a project-level dependency. Its returned IDs
+        // are cross-checked because accepting mismatched metadata could install a
+        // different project than the parent declared.
         let child = if let Some(id) = &dep.version_id {
             valid_id(id)?;
             let child = source.version(id)?;
@@ -491,10 +555,14 @@ fn visit(
         };
         visit(source, child, game, loader, selected, plan)?;
     }
+    // Post-order insertion is what makes the eventual download list dependency-first.
     plan.push(release);
     Ok(())
 }
 
+// Restrict API-controlled names to one portable JAR basename. Besides blocking path
+// traversal, rejecting hidden names and Windows device names avoids platform-dependent
+// destinations and makes the earlier case-folded collision check meaningful.
 fn safe_filename(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
     let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
@@ -535,6 +603,8 @@ fn primary_file(release: &Version) -> Result<&VersionFile, String> {
     Ok(file)
 }
 
+// Per-file staging keeps incomplete bytes out of `mods`. Drop is best-effort rollback for
+// ordinary errors and unwinding; a process abort/crash can still leave the hidden folder.
 struct Staging(PathBuf);
 impl Drop for Staging {
     fn drop(&mut self) {
@@ -555,6 +625,8 @@ fn staging(mods: &Path) -> Result<Staging, String> {
     Err("Unable to reserve a staging directory".into())
 }
 
+// Existing destinations are reused only after a full byte comparison. `symlink_metadata`
+// deliberately rejects symlinks and other non-regular nodes before either path is opened.
 fn same_file(existing: &Path, staged: &Path) -> Result<bool, String> {
     let metadata = fs::symlink_metadata(existing)
         .map_err(|e| format!("Inspect {}: {e}", existing.display()))?;
@@ -584,6 +656,8 @@ fn same_file(existing: &Path, staged: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
+// `Read` keeps storage independent of reqwest and permits bounded in-memory readers in
+// tests. The caller supplies a mutable reader because copying advances its stream.
 fn store_file(mods: &Path, file: &VersionFile, input: &mut impl Read) -> Result<PathBuf, String> {
     if !safe_filename(&file.filename) {
         return Err(format!("Unsafe filename: {:?}", file.filename));
@@ -592,6 +666,8 @@ fn store_file(mods: &Path, file: &VersionFile, input: &mut impl Read) -> Result<
     let partial = stage.0.join("download.part");
     let ready = stage.0.join("download.ready");
     let dest = mods.join(&file.filename);
+    // The closure gives all write/publish failures one contextual error boundary. It is
+    // called once and must be mutable because it captures and advances `input`.
     let operation = || -> Result<(), String> {
         let mut out = OpenOptions::new()
             .write(true)
@@ -609,6 +685,9 @@ fn store_file(mods: &Path, file: &VersionFile, input: &mut impl Read) -> Result<
             .and_then(|()| out.sync_all())
             .map_err(|e| e.to_string())?;
         drop(out);
+        // Rename marks a fully flushed staged file as ready. Publishing with a hard link
+        // is atomic and no-clobber on the same filesystem, unlike Unix `rename`, which
+        // would replace a concurrently created destination.
         fs::rename(&partial, &ready).map_err(|e| e.to_string())?;
         match fs::hard_link(&ready, &dest) {
             Ok(()) => Ok(()),

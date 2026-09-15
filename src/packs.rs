@@ -1,8 +1,36 @@
-//! Secure import and export of launcher instance packs.
+//! Secure, blocking import, inspection, and export of launcher instance packs.
 //!
-//! This module deliberately supports only documented, locally verifiable pack
-//! structures. Loader pins are reported as metadata; installing a loader is the
-//! caller's responsibility.
+//! Format detection is manifest-first: Ferrite, Modrinth, CurseForge, and Prism packs
+//! are recognized by their documented root metadata, while an otherwise valid ZIP is
+//! treated as a generic game directory. Known `.ferritepack` and `.mrpack` extensions
+//! do not fall back to generic ZIP when their required manifest is absent, and Lunar
+//! `.lcpack` is rejected because there is no supported public interchange schema.
+//!
+//! Import scans the whole central directory before parsing manifests or writing files.
+//! The scan enforces configured entry and expanded-size limits, relative portable names,
+//! unique case-folded paths, and regular-file/directory Unix modes. Extraction happens in
+//! a new sibling staging directory and is renamed into place only after all archive reads,
+//! downloads, hash/size checks, and overlays succeed. Ordinary errors remove that staging
+//! tree, so they do not leave a partial destination; a process crash can leave the hidden
+//! temporary tree. The final rename is not a transaction with other processes, and callers
+//! should not permit hostile concurrent mutation of the archive, destination parent, or
+//! instance tree.
+//!
+//! Modrinth imports download required client files (and optional files when requested),
+//! verify declared size plus SHA-512 and SHA-1, then apply `overrides/` followed by
+//! `client-overrides/`. CurseForge imports resolve required project files through its API,
+//! skip optional entries, verify exact size and SHA-1 when supplied, then apply the named
+//! overrides directory. Network access is HTTPS-only and rejects credentialed URLs,
+//! localhost names, and literal private/local IP addresses; it does not resolve hostnames
+//! itself to detect DNS rebinding. There are no retries, cancellation hooks, or resumable
+//! downloads.
+//!
+//! Exports are self-contained override archives: Modrinth and CurseForge manifests contain
+//! empty downloadable-file lists, with selected instance files embedded under their
+//! overrides roots. Volatile/user-specific paths are excluded, worlds are opt-in, and
+//! symlinks or special files abort export. The completed ZIP is published with a no-clobber
+//! hard link, so the output filesystem must support hard links. Loader pins are metadata
+//! only in every format; installing the requested loader remains the caller's responsibility.
 
 use crate::instances::InstanceProfile;
 use crate::loaders::ModLoader;
@@ -20,6 +48,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zip::write::FileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+/// Pack layouts recognized by this module.
+///
+/// Presence in this enum does not imply bidirectional support: [`PackFormat::Lunar`] is
+/// exposed for UI labeling/extension handling but inspection, import, and export reject it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackFormat {
     Ferrite,
@@ -31,6 +63,8 @@ pub enum PackFormat {
 }
 
 impl PackFormat {
+    /// Stable list used by format pickers; unsupported operations can still return
+    /// [`PackError::Unsupported`] for a listed format.
     pub const ALL: [PackFormat; 6] = [
         PackFormat::Ferrite,
         PackFormat::Modrinth,
@@ -40,6 +74,7 @@ impl PackFormat {
         PackFormat::Lunar,
     ];
 
+    /// Human-readable label intended for launcher UI.
     pub fn label(self) -> &'static str {
         match self {
             Self::Ferrite => "Ferrite Pack",
@@ -62,6 +97,10 @@ impl PackFormat {
     }
 }
 
+/// Minecraft and loader metadata declared by a pack or supplied for a generic ZIP.
+///
+/// A missing `loader_version` is valid for vanilla and for inspection, but exports whose
+/// manifest requires an exact non-vanilla loader pin reject it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackTarget {
     pub minecraft_version: String,
@@ -69,6 +108,10 @@ pub struct PackTarget {
     pub loader_version: Option<String>,
 }
 
+/// Metadata obtained without extracting or downloading pack payloads.
+///
+/// `warnings` describe format-level caveats discovered during inspection. Import starts
+/// with these warnings and may append per-file skips or missing-hash notices.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackInfo {
     pub format: PackFormat,
@@ -79,6 +122,11 @@ pub struct PackInfo {
     pub warnings: Vec<String>,
 }
 
+/// Resource limits applied to both archive expansion and downloaded pack files.
+///
+/// Declared ZIP sizes are checked during the initial scan and actual copied byte counts
+/// are checked again during extraction. The total budget is shared by extracted entries
+/// and network downloads within an import.
 #[derive(Debug, Clone, Copy)]
 pub struct ArchiveLimits {
     pub max_entries: usize,
@@ -97,6 +145,12 @@ impl Default for ArchiveLimits {
     }
 }
 
+/// Policy and resource controls for [`import`].
+///
+/// Generic ZIPs have no trustworthy target metadata, so `generic_target` is mandatory for
+/// that fallback format. Optional Modrinth files are opt-in; optional CurseForge files are
+/// always skipped by this implementation. A CurseForge API key is required only when its
+/// manifest contains project files to resolve.
 #[derive(Debug, Clone)]
 pub struct ImportOptions {
     pub generic_target: Option<PackTarget>,
@@ -116,6 +170,10 @@ impl Default for ImportOptions {
     }
 }
 
+/// Outcome of a successful import.
+///
+/// Counts include files downloaded or extracted, including an overlay each time it is
+/// written. They do not count directories or manifest entries that are only inspected.
 #[derive(Debug, Clone)]
 pub struct ImportReport {
     pub info: PackInfo,
@@ -124,6 +182,11 @@ pub struct ImportReport {
     pub warnings: Vec<String>,
 }
 
+/// Metadata and file-selection policy for [`export`].
+///
+/// `include_worlds` controls the top-level `saves/` tree; volatile launcher/game paths are
+/// excluded regardless. Modrinth and CurseForge exports default a missing pack version to
+/// `1.0.0` in their manifests.
 #[derive(Debug, Clone)]
 pub struct ExportOptions {
     pub format: PackFormat,
@@ -135,6 +198,11 @@ pub struct ExportOptions {
     pub include_worlds: bool,
 }
 
+/// Failures are classified so callers can distinguish malformed input, security policy,
+/// configured resource limits, unsupported formats, and recoverable setup requirements.
+/// I/O, network, ZIP, and JSON variants retain their typed errors for display or direct
+/// pattern matching. This type does not override [`std::error::Error::source`], so those
+/// values are not exposed through Rust's standard error-source chain.
 #[derive(Debug)]
 pub enum PackError {
     Io(io::Error),
@@ -214,6 +282,8 @@ struct WriteStats {
     bytes: u64,
 }
 
+// RAII cleanup arms temporary paths immediately after creation. Successful publication
+// disarms the guard; every ordinary early return removes the partial file/tree best-effort.
 struct CleanupPath {
     path: PathBuf,
     directory: bool,
@@ -247,6 +317,10 @@ impl Drop for CleanupPath {
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+// A sibling temporary lives on the destination filesystem, allowing final rename/import
+// or hard-link/export publication without crossing filesystem boundaries. The generated
+// name is collision-resistant but creation still uses `create_new`/`create_dir` as the
+// actual exclusivity check.
 fn temporary_sibling(path: &Path, kind: &str) -> Result<PathBuf> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("pack");
@@ -268,10 +342,25 @@ fn lunar_error() -> PackError {
     )
 }
 
+/// Validate an archive and return its format/target metadata without extracting payloads.
+///
+/// `impl AsRef<Path>` accepts owned and borrowed path-like values. Inspection uses default
+/// limits, performs no network requests, and can still fail for unsafe payload entry names
+/// because the entire archive is catalogued before its manifest is trusted.
 pub fn inspect(path: impl AsRef<Path>) -> Result<PackInfo> {
     inspect_with_limits(path.as_ref(), ArchiveLimits::default())
 }
 
+/// Import a pack into a destination that must not already exist.
+///
+/// Both paths accept owned or borrowed path-like values. `progress` is an `FnMut` because
+/// callers commonly update captured UI/task state; it is invoked synchronously on this
+/// blocking call's thread and messages are status snapshots, not a stable machine-readable
+/// protocol. The closure may be called before an eventual error.
+///
+/// All writes occur in a sibling staging tree. On success that tree is renamed to the
+/// destination; on an ordinary error it is removed. The destination parent must already
+/// exist, and no attempt is made to install the loader recorded in [`PackInfo`].
 pub fn import(
     path: impl AsRef<Path>,
     destination: impl AsRef<Path>,
@@ -309,6 +398,8 @@ pub fn import(
     let mut stats = WriteStats::default();
     let mut warnings = info.warnings.clone();
 
+    // Keep format-specific extraction and final publication inside one fallible boundary;
+    // the outer cleanup guard remains armed for every `?` and explicit error in this block.
     let result = (|| {
         match info.format {
             PackFormat::Ferrite => {
@@ -371,6 +462,9 @@ pub fn import(
             }
             PackFormat::Lunar => return Err(lunar_error()),
         }
+        // Recheck after potentially long downloads to catch ordinary races. This is not a
+        // no-clobber primitive on every platform: callers must still serialize writers to
+        // the destination parent.
         if destination.exists() {
             return Err(PackError::AlreadyExists(destination.to_owned()));
         }
@@ -389,6 +483,12 @@ pub fn import(
     })
 }
 
+/// Export an instance to a newly created archive.
+///
+/// `progress` follows the same synchronous `FnMut` contract as [`import`]. An explicit,
+/// non-empty loader version overrides the launcher's installed-version lookup; otherwise
+/// that lookup is the only fallback. Formats requiring a non-vanilla loader pin fail if
+/// neither source provides one. The output is never intentionally replaced.
 pub fn export(
     profile: &InstanceProfile,
     output: impl AsRef<Path>,
@@ -426,6 +526,10 @@ fn inspect_with_limits(path: &Path, limits: ArchiveLimits) -> Result<PackInfo> {
     inspect_catalog(path, &catalog)
 }
 
+// Manifest names take precedence over the filename extension so ordinary `.zip` exports
+// from third-party launchers are recognized. Conversely, known dedicated extensions are
+// treated as promises and fail when their manifest is absent rather than silently becoming
+// a generic archive.
 fn inspect_catalog(path: &Path, catalog: &ArchiveCatalog) -> Result<PackInfo> {
     let extension = path
         .extension()
@@ -480,6 +584,9 @@ fn inspect_catalog(path: &Path, catalog: &ArchiveCatalog) -> Result<PackInfo> {
     })
 }
 
+// Catalog once before any extraction. Exact and case-folded duplicate rejection prevents
+// archives from producing different results across filesystems; declared uncompressed
+// sizes provide an early ZIP-bomb bound, while extraction later verifies actual counts.
 fn scan_archive(path: &Path, limits: ArchiveLimits) -> Result<ArchiveCatalog> {
     let file = File::open(path)?;
     let mut archive = ZipArchive::new(file)?;
@@ -532,6 +639,9 @@ fn scan_archive(path: &Path, limits: ArchiveLimits) -> Result<ArchiveCatalog> {
     Ok(ArchiveCatalog { entries, names })
 }
 
+// Enforce a cross-platform relative-path subset rather than merely relying on `Path`.
+// This blocks traversal/absolute paths and Windows aliases such as device names, drive
+// prefixes, alternate-data-stream colons, and trailing dot/space normalization.
 fn validate_zip_name(raw: &str, is_dir: bool) -> Result<String> {
     if raw.is_empty() || raw.chars().any(char::is_control) || raw.contains('\\') {
         return Err(PackError::Security(format!("invalid ZIP path {raw:?}")));
@@ -611,6 +721,9 @@ fn validate_unix_mode(mode: Option<u32>, is_dir: bool, name: &str) -> Result<()>
     Ok(())
 }
 
+// Metadata is read into memory only after an independent 16 MiB cap. Reopening the archive
+// avoids retaining a borrow from `ZipArchive`, and checking the copied length detects a
+// changed/truncated entry relative to the catalog.
 fn read_entry(path: &Path, catalog: &ArchiveCatalog, name: &str) -> Result<Vec<u8>> {
     let index = *catalog
         .names
@@ -989,6 +1102,9 @@ fn extract_prefix_with_mode(
     extract_entries(path, selected, destination, limits, stats, overlay)
 }
 
+// Generic archives have no standard root. Ignore common macOS metadata and strip exactly
+// one common wrapper directory only when every meaningful file is beneath it; otherwise
+// preserve paths as authored.
 fn extract_generic(
     path: &Path,
     catalog: &ArchiveCatalog,
@@ -1041,6 +1157,9 @@ fn is_junk_path(path: &str) -> bool {
     path == ".DS_Store" || path.starts_with("__MACOSX/")
 }
 
+// `overlay` is reserved for format-defined overrides. Initial payload writes use
+// `create_new`; overlays may replace an existing regular file via a completed sibling
+// temporary, but never follow or replace a symlink/non-file target.
 fn extract_entries(
     path: &Path,
     selected: Vec<(&EntryMeta, String)>,
@@ -1132,6 +1251,9 @@ fn ensure_beneath(root: &Path, output: &Path) -> Result<()> {
     }
 }
 
+// The pack's client environment controls inclusion because this launcher imports a client
+// instance. Download mirrors are considered in manifest order and the first HTTPS URL is
+// used; there is no retry/fallback to a later mirror after a transfer failure.
 fn import_modrinth(
     path: &Path,
     catalog: &ArchiveCatalog,
@@ -1246,6 +1368,9 @@ fn import_modrinth(
     Ok(())
 }
 
+// CurseForge manifests identify project/file IDs rather than direct trusted artifacts.
+// Resolve each required item through the API so filename, URL, size, and optional SHA-1
+// come from CurseForge; restricted third-party downloads remain an explicit error.
 fn import_curseforge(
     path: &Path,
     catalog: &ArchiveCatalog,
@@ -1396,6 +1521,9 @@ fn validate_override_directory(value: &str) -> Result<String> {
     Ok(normalized)
 }
 
+// Redirects are revalidated under the same URL policy and capped at ten hops. DNS names
+// are not resolved here, so only literal private/local addresses and localhost names can
+// be rejected before reqwest connects.
 fn safe_http_client() -> Result<reqwest::blocking::Client> {
     let redirects = reqwest::redirect::Policy::custom(|attempt| {
         if attempt.previous().len() >= 10 || validate_download_url(attempt.url()).is_err() {
@@ -1451,6 +1579,9 @@ fn validate_download_url(url: &reqwest::Url) -> Result<()> {
     Ok(())
 }
 
+// Stream directly into the import staging tree while hashing. Declared size is checked
+// both before the request (budget reservation) and during/after transfer; a failed partial
+// file is harmless to the final destination because the whole staging tree is rolled back.
 fn download_file(
     client: &reqwest::blocking::Client,
     url: &str,
@@ -1538,6 +1669,8 @@ fn download_file(
     Ok(())
 }
 
+// Internal form takes an explicit target, which keeps format serialization testable apart
+// from `InstanceProfile` and the installed-loader lookup used by the public wrapper.
 fn export_directory(
     source: &Path,
     output: &Path,
@@ -1694,6 +1827,8 @@ fn export_directory(
     Ok(())
 }
 
+// The generic `Serialize` bound lets typed Ferrite manifests and ad-hoc JSON values share
+// identical ZIP-writing behavior without converting every model through `Value`.
 fn write_json_to_zip<T: Serialize>(
     zip: &mut ZipWriter<File>,
     name: &str,
@@ -1705,6 +1840,9 @@ fn write_json_to_zip<T: Serialize>(
     Ok(())
 }
 
+// Collection is separate from writing so a symlink/special-file failure is discovered
+// before the archive receives payload entries. Sorting produces deterministic entry order,
+// though ZIP metadata/compression does not promise byte-for-byte reproducible archives.
 fn collect_export_files(root: &Path, include_worlds: bool) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     collect_export_files_at(root, root, include_worlds, &mut files)?;
@@ -1751,6 +1889,8 @@ fn collect_export_files_at(
     Ok(())
 }
 
+// Exclusions remove volatile diagnostics, caches, screenshots, and account-adjacent state;
+// worlds are large and potentially private, so `saves/` requires explicit opt-in.
 fn excluded_export_path(path: &Path, include_worlds: bool) -> bool {
     let first = match path.components().next() {
         Some(Component::Normal(value)) => value.to_string_lossy().to_ascii_lowercase(),
@@ -1770,6 +1910,9 @@ fn excluded_export_path(path: &Path, include_worlds: bool) -> bool {
     ) || (!include_worlds && first == "saves")
 }
 
+// `FnMut` permits stateful progress sinks and `&mut impl FnMut` threads one sink through
+// nested helpers without moving it. Messages are emitted before opening/copying each file,
+// so the last message is not proof that the corresponding write succeeded.
 fn write_selected_files(
     zip: &mut ZipWriter<File>,
     source: &Path,

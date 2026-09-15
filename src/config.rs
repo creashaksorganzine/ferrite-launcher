@@ -1,4 +1,18 @@
-//! Persistent launcher configuration stored in the platform's user config directory.
+//! Persistent, non-secret launcher preferences.
+//!
+//! [`config_path`] uses [`directories::ProjectDirs`] to select the platform-specific
+//! per-user configuration directory and appends `config.toml`. The entire [`Config`]
+//! is serialized as human-readable TOML; missing tables and fields inherit defaults
+//! through Serde's `default` handling, while known values are semantically validated.
+//!
+//! [`load`] is strict. Startup code can instead use [`load_or_create`], which creates
+//! a default file when none exists and recovers from syntactically malformed or
+//! type-invalid TOML by returning defaults plus a warning. Files that parse but fail
+//! semantic validation, filesystem failures, and unavailable platform directories are
+//! still returned as errors so callers can decide whether an in-memory fallback is safe.
+//!
+//! This module stores preferences only. Credentials and access tokens do not belong in
+//! [`Config`] or in raw TOML supplied to [`save_toml`].
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -13,6 +27,10 @@ const ORGANIZATION: &str = "Ferrite";
 const APPLICATION: &str = "Ferrite Launcher";
 const FILE_NAME: &str = "config.toml";
 
+/// Complete on-disk configuration.
+///
+/// Deserializing a partial file fills absent sections and fields from [`Default`],
+/// which allows newer versions to add settings without requiring a migration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Config {
@@ -66,6 +84,7 @@ impl Config {
     }
 }
 
+/// Visual preferences applied by the launcher UI.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AppearanceConfig {
@@ -86,6 +105,7 @@ impl Default for AppearanceConfig {
     }
 }
 
+/// General launcher behavior and update-check preferences.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct LauncherConfig {
@@ -104,6 +124,7 @@ impl Default for LauncherConfig {
     }
 }
 
+/// Discord integration preferences; no Discord credentials are stored here.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct DiscordConfig {
@@ -118,6 +139,7 @@ impl Default for DiscordConfig {
     }
 }
 
+/// Defaults used when launching Minecraft instances.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct MinecraftConfig {
@@ -132,6 +154,13 @@ impl Default for MinecraftConfig {
     }
 }
 
+/// Failure while locating, decoding, validating, writing, or revealing configuration.
+///
+/// Parse and serialization variants retain their typed errors for formatting or direct
+/// pattern matching. Because this type does not override [`std::error::Error::source`],
+/// callers cannot traverse those values through Rust's standard error-source chain.
+/// Displayed messages may include filesystem paths or TOML locations, but this module
+/// never intentionally places configuration contents in an error.
 #[derive(Debug)]
 pub enum ConfigError {
     ConfigDirectoryUnavailable,
@@ -182,42 +211,67 @@ impl From<toml::ser::Error> for ConfigError {
     }
 }
 
-/// Result of startup loading. Invalid TOML falls back to defaults with a warning.
+/// Result of startup-oriented loading.
+///
+/// `warning` is populated when an existing file could not be deserialized and the
+/// returned configuration is therefore an in-memory default. The invalid file is
+/// left untouched until the caller explicitly saves a setting.
 pub struct ConfigLoad {
+    /// Configuration to apply for this process.
     pub config: Config,
+    /// User-facing explanation of a recoverable fallback, if one occurred.
     pub warning: Option<String>,
 }
 
-/// Strictly loads Ferrite's config from disk.
+/// Strictly reads, parses, and validates Ferrite's configuration from disk.
+///
+/// Unlike [`load_or_create`], a missing or malformed file is returned as an error and
+/// no filesystem state is changed.
 pub fn load() -> Result<Config, ConfigError> {
     parse_toml(&read_toml()?)
 }
 
-/// Reads the config file from disk without parsing it.
+/// Reads the config file as UTF-8 text without parsing or validating it.
+///
+/// This performs filesystem I/O only and is useful for displaying the exact source
+/// in an advanced editor.
 pub fn read_toml() -> Result<String, ConfigError> {
     Ok(fs::read_to_string(config_path()?)?)
 }
 
-/// Parses a complete TOML configuration, applying defaults for missing fields.
+/// Parses and validates TOML, applying defaults for missing sections and fields.
+///
+/// Unknown fields follow Serde's normal behavior and are ignored. No disk I/O occurs.
 pub fn parse_toml(input: &str) -> Result<Config, ConfigError> {
     let config: Config = toml::from_str(input)?;
     config.validate()?;
     Ok(config)
 }
 
-/// Serializes a configuration as human-readable TOML.
+/// Serializes a complete configuration as human-readable TOML without writing it.
+///
+/// This does not revalidate a programmatically constructed [`Config`].
 pub fn to_toml(config: &Config) -> Result<String, ConfigError> {
     Ok(toml::to_string_pretty(config)?)
 }
 
-/// Parses and saves TOML, leaving the existing file untouched if parsing fails.
+/// Parses, validates, and saves TOML, returning the normalized configuration.
+///
+/// Parsing and validation happen before any write, so those failures leave the
+/// existing file untouched. Successful output is formatted by [`to_toml`] rather
+/// than preserving the input's comments or whitespace.
 pub fn save_toml(input: &str) -> Result<Config, ConfigError> {
     let config = parse_toml(input)?;
     save(&config)?;
     Ok(config)
 }
 
-/// Loads Ferrite's config, creating a default file when none exists.
+/// Loads configuration for startup, creating a default file when none exists.
+///
+/// Deserialization failures (including malformed TOML and field type mismatches)
+/// return defaults with a warning and preserve the bad file for inspection. Semantic
+/// validation and I/O failures remain errors. Creating a missing file also creates
+/// its parent directory and can therefore fail.
 pub fn load_or_create() -> Result<ConfigLoad, ConfigError> {
     let path = config_path()?;
     match read_toml() {
@@ -248,6 +302,14 @@ pub fn load_or_create() -> Result<ConfigLoad, ConfigError> {
 }
 
 /// Saves the complete configuration as human-readable TOML.
+///
+/// The parent directory is created as needed. Data is first written to a sibling
+/// temporary file, then renamed into place to avoid exposing a partially written
+/// TOML file. If the first rename fails while a destination exists, the implementation
+/// removes that destination and retries on every platform. That fallback is not atomic:
+/// a second rename failure can leave no active configuration file.
+///
+/// This function serializes the supplied value but does not call semantic validation.
 pub fn save(config: &Config) -> Result<(), ConfigError> {
     let path = config_path()?;
     let parent = path
@@ -257,7 +319,8 @@ pub fn save(config: &Config) -> Result<(), ConfigError> {
     let temporary = path.with_extension("toml.tmp");
     fs::write(&temporary, to_toml(config)?)?;
 
-    // Unix renames replace atomically. Windows requires removing the destination first.
+    // Prefer replacement by rename. The remove-and-retry fallback handles platforms
+    // that reject replacing an existing file, but sacrifices atomic replacement.
     if let Err(error) = fs::rename(&temporary, &path) {
         if path.exists() {
             fs::remove_file(&path)?;
@@ -270,6 +333,10 @@ pub fn save(config: &Config) -> Result<(), ConfigError> {
 }
 
 /// Opens the directory containing Ferrite's configuration file.
+///
+/// Creates the directory first, then spawns the platform file browser (`explorer`,
+/// `open`, or `xdg-open`). Success means the process was launched; it does not wait
+/// for the browser or prove that a window became visible.
 pub fn open_config_folder() -> Result<(), ConfigError> {
     let path = config_path()?;
     let folder = path
@@ -295,6 +362,11 @@ pub fn open_config_folder() -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Returns the platform-specific path to Ferrite's `config.toml`.
+///
+/// This is a pure path lookup: it neither creates the directory nor checks that the
+/// file exists. It fails on platforms where a user configuration directory cannot
+/// be determined.
 pub fn config_path() -> Result<PathBuf, ConfigError> {
     let directories = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
         .ok_or(ConfigError::ConfigDirectoryUnavailable)?;

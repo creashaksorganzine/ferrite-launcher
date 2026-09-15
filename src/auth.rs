@@ -1,13 +1,28 @@
 //! Session-only Microsoft consumer device-code authentication for Minecraft Java.
 //!
+//! The protocol is split into two blocking operations:
+//!
+//! 1. [`start_login`] requests a device code. The caller displays the public
+//!    [`DeviceCode::user_code`] and [`DeviceCode::verification_uri`] to the user.
+//! 2. [`complete_login`] polls Microsoft for approval, then exchanges the Microsoft
+//!    token for Xbox Live, XSTS, and finally Minecraft Services credentials. It also
+//!    verifies Java ownership and fetches the player's profile.
+//!
 //! Supply your own Microsoft application (public client) ID, configured to allow
 //! consumer accounts and device-code/public-client authentication. Microsoft or
 //! Minecraft may require approval of the application for Minecraft Services use.
-//! Run these blocking functions on a worker thread, not the UI thread. Display
-//! `DeviceCode::user_code` and `DeviceCode::verification_uri` before completing login.
-//! No credentials are logged or persisted, and no refresh token is requested.
-//! Re-sign in when `Account::is_expired()` becomes true. The caller must likewise
-//! keep the access token out of logs and persistent storage.
+//! Both operations perform blocking network I/O and therefore belong on a worker
+//! thread rather than the UI thread.
+//!
+//! Authentication is intentionally session-only: no refresh token is requested,
+//! and this module neither logs nor persists credentials. Re-sign in when
+//! [`Account::is_expired`] becomes true. Callers must likewise keep `DeviceCode`
+//! and [`Account::access_token`] out of logs, diagnostics, and persistent storage.
+//!
+//! Cancellation is cooperative. A typical caller owns an `Arc<AtomicBool>`, keeps
+//! one clone in UI/task state, and passes the worker clone to [`complete_login`] as
+//! `&AtomicBool`. Setting it stops polling promptly, but cannot abort a blocking
+//! HTTP request already in progress; request timeouts bound that delay.
 
 use std::{
     io::Read,
@@ -36,18 +51,23 @@ const MAX_BODY: u64 = 1024 * 1024;
 
 /// Authenticated Minecraft Java account, held only for this process/session.
 ///
-/// Deliberately does not implement `Debug` or serialization. `uuid` is lowercase
-/// hexadecimal without hyphens. The token is
-/// a Minecraft Services token, not a Microsoft or Xbox token. Do not log it.
+/// Deliberately does not implement `Debug` or serialization, reducing the chance
+/// of accidentally exposing the token through ordinary diagnostics or persistence.
+/// The caller is still responsible for protecting every field copied from this value.
 pub struct Account {
+    /// Verified Java profile name.
     pub name: String,
+    /// Verified lowercase hexadecimal UUID without hyphens.
     pub uuid: String,
+    /// Minecraft Services bearer token, not a Microsoft or Xbox token. Do not log it.
     pub access_token: String,
     /// Decimal Xbox user ID, or empty if neither Xbox response provides `xid`.
     /// The empty value is valid for the optional launch placeholder; `uhs` is
     /// a different identifier and is never substituted for a missing XUID.
     pub xuid: String,
+    /// Public Microsoft application ID used for this sign-in.
     pub client_id: String,
+    /// Monotonic expiry deadline for the Minecraft Services token.
     expires: Instant,
 }
 
@@ -60,9 +80,14 @@ impl Account {
 }
 
 /// Instructions for the user plus private, short-lived polling credentials.
-/// Deliberately does not implement `Debug` or serialization.
+///
+/// Deliberately does not implement `Debug` or serialization because its private
+/// fields authorize polling for this sign-in attempt. Only the public code and URL
+/// should cross from the authentication worker to display code.
 pub struct DeviceCode {
+    /// Short code the user enters at Microsoft's verification page.
     pub user_code: String,
+    /// HTTPS page where the user approves the sign-in.
     pub verification_uri: String,
     device_code: String,
     client_id: String,
@@ -165,6 +190,9 @@ fn client() -> Result<Client, String> {
         .map_err(|_| "Could not initialize the secure authentication client.".into())
 }
 
+/// Deserializes a bounded response without ever incorporating its body into errors.
+/// This prevents unexpectedly large payloads and server-returned secrets from
+/// reaching user-visible diagnostics.
 fn decode<T: DeserializeOwned>(reader: impl Read) -> Result<T, String> {
     serde_json::from_reader(reader.take(MAX_BODY))
         .map_err(|_| "Authentication service returned an invalid or oversized response.".into())
@@ -202,6 +230,8 @@ fn http_error(stage: &str, status: reqwest::StatusCode) -> String {
     )
 }
 
+/// Sends one blocking request with cancellation checks on both sides of the wait.
+/// A flag set during `send` is observed only after reqwest returns or times out.
 fn send(request: RequestBuilder, cancel: &AtomicBool, stage: &str) -> Result<Response, String> {
     cancelled(cancel)?;
     let response = request.send();
@@ -237,10 +267,16 @@ fn require_token_lifetime(expires: Instant) -> Result<(), String> {
     }
 }
 
-/// Start a consumer Microsoft device-code login using the supplied public client.
+/// Starts a consumer Microsoft device-code login using the supplied public client ID.
 ///
-/// Show the returned code and HTTPS verification URL to the user. This request
-/// has a 15-second timeout. Errors are sanitized and contain no response bodies.
+/// The ID is trimmed and must be non-empty. On success, the returned value contains
+/// public instructions for the UI and private state later consumed by
+/// [`complete_login`]. This function performs one blocking HTTPS request with a
+/// 15-second timeout and does not itself support cancellation.
+///
+/// Errors are user-facing, sanitized messages: response bodies and raw service
+/// descriptions are deliberately omitted because they may contain credentials or
+/// other sensitive account data.
 pub fn start_login(id: &str) -> Result<DeviceCode, String> {
     let id = client_id(id)?;
     let client = client()?;
@@ -429,6 +465,8 @@ fn xbox_user(data: &XboxResponse) -> Result<&XboxUser, String> {
 }
 
 fn optional_xuid(xsts: Option<&str>, xbl: Option<&str>) -> Result<String, String> {
+    // XUID is optional in these responses, but any value that is supplied must be
+    // a nonzero decimal u64 and both protocol stages must identify the same user.
     for id in [xsts, xbl].into_iter().flatten() {
         if id.is_empty()
             || !id.bytes().all(|c| c.is_ascii_digit())
@@ -446,6 +484,8 @@ fn optional_xuid(xsts: Option<&str>, xbl: Option<&str>) -> Result<String, String
 }
 
 fn verified_profile(profile: Profile) -> Result<(String, String), String> {
+    // Minecraft commonly emits a compact UUID, but accepting the canonical
+    // hyphenated representation makes normalization robust without relaxing its shape.
     let id = profile.id.as_bytes();
     let valid = (id.len() == 32 && id.iter().all(u8::is_ascii_hexdigit))
         || (id.len() == 36
@@ -476,14 +516,23 @@ fn owns_java(data: &Entitlements) -> bool {
         .any(|item| matches!(item.name.as_str(), "game_minecraft" | "product_minecraft"))
 }
 
-/// Poll for approval, exchange Microsoft → Xbox Live → XSTS → Minecraft tokens,
-/// and verify Java entitlement and the Minecraft profile before returning.
+/// Completes device-code login and returns a verified, session-only Java account.
 ///
-/// `id` must match the public client ID used by `start_login`. Set `cancel` to
-/// true to stop; waits check it every 100 ms and network requests have a 15-second
-/// timeout (cancellation does not interrupt an in-flight blocking request).
-/// `progress` is called synchronously on this worker thread with static,
-/// non-sensitive status messages. Errors never include raw server messages.
+/// `id` must match the public client ID passed to [`start_login`], and `code` is
+/// consumed so one attempt's private polling credential cannot be accidentally reused.
+/// The function waits for Microsoft approval, then performs the Microsoft → Xbox Live
+/// → XSTS → Minecraft token exchanges. Before returning it verifies a Java entitlement,
+/// validates the profile name/UUID, and ensures the final token has useful lifetime.
+///
+/// `cancel` is normally borrowed from the worker's clone of an `Arc<AtomicBool>`.
+/// Setting it to `true` stops waits within about 100 ms and is checked around each
+/// network call. It does not interrupt an in-flight blocking request, which may take
+/// up to the configured 15-second request timeout. Relaxed atomic ordering is enough
+/// because the flag communicates only cancellation, not access to other shared data.
+///
+/// `progress` runs synchronously on the calling worker thread and receives only
+/// static, non-sensitive status text. The returned error is suitable for display:
+/// raw response bodies, service descriptions, and tokens are never included.
 pub fn complete_login(
     id: &str,
     code: DeviceCode,

@@ -27,6 +27,13 @@
 //! version into the synthetic id. `launch_version` looks for natives
 //! under `natives/<this version's id>`, but extraction only happens
 //! for the vanilla id during `install_version`.
+//!
+//! The synthetic version and Fabric dependencies use the same relative
+//! `minecraft/versions/` and `minecraft/libraries/` storage as vanilla. A
+//! `fabric-loader.txt` marker is written only after metadata, client, natives,
+//! and libraries complete successfully. Earlier failures may leave reusable
+//! partial files, but dispatch will treat the loader as uninstalled until that
+//! marker commits the composite id.
 
 use crate::minecraft::{self, FerriteError, Result};
 use reqwest::blocking::Client;
@@ -43,7 +50,13 @@ pub fn install(mc_version: &str) -> Result<()> {
     install_version(mc_version, None)
 }
 
-/// Installs a requested Fabric version, or the latest stable build when omitted.
+/// Installs a requested Fabric version, or discovers a stable build when omitted.
+///
+/// A non-empty requested version is used verbatim and validated by fetching its
+/// profile. With no request, Fabric's API order is trusted: the first stable
+/// entry wins, falling back to the first published entry if none is marked
+/// stable. Network, metadata, and filesystem errors abort without writing the
+/// marker, although the preceding vanilla install and partial cache remain.
 pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> {
     minecraft::install_version(mc_version)?;
 
@@ -120,6 +133,9 @@ struct LoaderInfo {
     stable: bool,
 }
 
+/// Selects the first stable API entry, or the first entry of any kind. An empty
+/// response is reported as `LoaderVersionUnavailable`; HTTP and JSON failures
+/// retain their more specific shared error variants.
 fn latest_stable_loader_version(client: &Client, mc_version: &str) -> Result<String> {
     let url = format!("{META_BASE}/{mc_version}");
     let text = client.get(&url).send()?.error_for_status()?.text()?;
@@ -147,10 +163,13 @@ fn fetch_profile(
 // Metadata merging
 // ---------------------------------------------------------------------
 
-/// Builds a synthetic vanilla-shaped version metadata JSON: identical
-/// to the vanilla version's own metadata, except for `id`, `mainClass`
-/// (taken from Fabric's profile), and `libraries` / `arguments.game`
-/// (vanilla's, with Fabric's appended).
+/// Builds a synthetic vanilla-shaped version metadata JSON.
+///
+/// The function clones vanilla so assets, downloads, Java requirements, and JVM
+/// arguments remain owned by the result. It then replaces `id` and, when
+/// present, `mainClass`; appends convertible Fabric libraries and Fabric game
+/// arguments in profile order. Malformed optional profile sections are skipped,
+/// leaving the corresponding vanilla data intact.
 fn merge_metadata(
     composite_id: &str,
     vanilla: &serde_json::Value,
@@ -219,6 +238,9 @@ fn convert_fabric_library(lib: &serde_json::Value) -> Option<serde_json::Value> 
     }))
 }
 
+/// Maps `group:artifact:version[:classifier]` to the standard repository path.
+/// Missing required components return `None`; components after the optional
+/// classifier are ignored because loader profiles use this four-part maximum.
 fn maven_coordinate_to_path(coordinate: &str) -> Option<String> {
     // "group.id:artifact:version[:classifier]" ->
     // "group/id/artifact/version/artifact-version[-classifier].jar"
@@ -240,6 +262,11 @@ fn maven_coordinate_to_path(coordinate: &str) -> Option<String> {
 // Library download
 // ---------------------------------------------------------------------
 
+/// Downloads profile libraries into the shared Maven cache.
+///
+/// A missing library array is a valid no-op. Entries without a usable name, URL,
+/// or coordinate are skipped. Existing destination paths are trusted without a
+/// size/hash check; the first HTTP or filesystem failure aborts the loop.
 fn download_fabric_libraries(client: &Client, profile: &serde_json::Value) -> Result<()> {
     let libs_dir = minecraft::libraries_dir();
     fs::create_dir_all(&libs_dir)?;

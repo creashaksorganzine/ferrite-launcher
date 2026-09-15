@@ -1,3 +1,15 @@
+//! Blocking update discovery using the repository's latest GitHub release.
+//!
+//! [`check_for_update`] fetches GitHub's `releases/latest` endpoint, parses the
+//! package version and release tag with [`semver::Version`], validates that the
+//! browser-facing release link is an HTTPS `github.com` URL, and reports whether the
+//! remote version has higher semantic-version precedence. It only checks metadata;
+//! it never downloads or installs an update.
+//!
+//! The request has bounded connect and overall timeouts but is synchronous, so UI
+//! callers should run it on a worker thread. Network, HTTP, JSON, version, and URL
+//! failures remain distinct through [`UpdateError`] for actionable diagnostics.
+
 use std::error::Error;
 use std::fmt;
 use std::time::Duration;
@@ -12,14 +24,24 @@ const LATEST_RELEASE_URL: &str =
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Metadata needed to present a newer release to the user.
 #[derive(Clone, Debug)]
 pub struct UpdateInfo {
+    /// Version compiled into this launcher binary.
     pub current_version: Version,
+    /// Version parsed from GitHub's latest release tag.
     pub latest_version: Version,
+    /// Validated HTTPS `github.com` page for the release.
     pub release_url: String,
+    /// Optional human-readable GitHub release title.
     pub release_name: Option<String>,
 }
 
+/// Outcome of comparing this build with GitHub's latest release.
+///
+/// Equal or older remote versions are both [`UpToDate`](Self::UpToDate); the checker
+/// never recommends a downgrade. Both versions are retained so the UI can explain
+/// exactly what was compared.
 #[derive(Clone, Debug)]
 pub enum UpdateCheck {
     UpToDate {
@@ -29,6 +51,11 @@ pub enum UpdateCheck {
     Available(UpdateInfo),
 }
 
+/// Error produced while fetching or validating release metadata.
+///
+/// The typed source errors are retained where available. HTTP errors intentionally
+/// expose only the status, and URL validation keeps an API response from directing
+/// the UI to a non-GitHub or cleartext link.
 #[derive(Debug)]
 pub enum UpdateError {
     Network(reqwest::Error),
@@ -90,6 +117,12 @@ struct ReleaseResponse {
     name: Option<String>,
 }
 
+/// Fetches and evaluates the repository's latest GitHub release.
+///
+/// The current version comes from `CARGO_PKG_VERSION` embedded at compile time. This
+/// function builds a fresh blocking client, performs one network request with a
+/// 10-second connect timeout and 30-second total timeout, and returns parsed metadata;
+/// it does not open the release URL or modify local files.
 pub fn check_for_update() -> Result<UpdateCheck, UpdateError> {
     let current_version_text = env!("CARGO_PKG_VERSION");
     let current_version = Version::parse(current_version_text).map_err(|source| {
@@ -134,6 +167,8 @@ fn evaluate_release(
     current_version: Version,
     release: ReleaseResponse,
 ) -> Result<UpdateCheck, UpdateError> {
+    // Release tags conventionally use `v1.2.3`, while the semver parser expects the
+    // numeric form. Strip exactly one conventional prefix and reject everything else.
     let version_text = release
         .tag_name
         .strip_prefix(['v', 'V'])
@@ -146,6 +181,8 @@ fn evaluate_release(
 
     validate_release_url(&release.html_url)?;
 
+    // `Version` comparison follows semver precedence, including prerelease ordering;
+    // build metadata does not make an otherwise equal version newer.
     if latest_version > current_version {
         Ok(UpdateCheck::Available(UpdateInfo {
             current_version,
@@ -161,6 +198,7 @@ fn evaluate_release(
     }
 }
 
+/// Restricts the untrusted API-provided link before it is exposed to browser-opening UI.
 fn validate_release_url(release_url: &str) -> Result<(), UpdateError> {
     let parsed = Url::parse(release_url).map_err(|_| UpdateError::InvalidReleaseUrl {
         url: release_url.to_owned(),

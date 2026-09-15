@@ -27,6 +27,21 @@
 //! `launch_version` behave identically from the caller's perspective
 //! regardless of which shape a given version uses.
 //!
+//! ## Storage and process model
+//!
+//! Launcher-managed content is rooted at the relative `minecraft/` directory.
+//! Version metadata and client jars live under `versions/<id>/`, Maven artifacts
+//! are shared under `libraries/`, content-addressed assets under `assets/`, and
+//! extracted native libraries under `natives/<id>/`. Because the root is
+//! relative, its absolute location depends on the launcher's working directory.
+//! Existing libraries and assets are treated as a download cache; version
+//! metadata and asset indexes are refreshed during installation.
+//!
+//! A process-wide `OnceLock<Mutex<Option<Child>>>` stores the one Minecraft
+//! child started by this process. The mutex permits UI and worker threads to
+//! inspect or kill the same owned `Child` handle without exposing it publicly;
+//! it is not inter-process locking, so another Ferrite process is independent.
+//!
 //! ## Mod loaders (Fabric, Forge, NeoForge, Quilt)
 //!
 //! This module has no idea mod loaders exist. `crate::loaders` builds
@@ -52,18 +67,25 @@ use zip::ZipArchive;
 // Error handling
 // =====================================================================
 
+/// Errors produced while discovering, installing, or launching Minecraft and
+/// loader-backed synthetic versions.
 #[derive(Debug)]
 pub enum FerriteError {
+    /// An HTTP request failed, including non-success status responses.
     Network(reqwest::Error),
+    /// A launcher-managed file or child process operation failed.
     Io(std::io::Error),
+    /// Mojang or loader metadata was not valid for the expected JSON shape.
     Json(serde_json::Error),
+    /// A native or installer archive could not be read or written.
     Zip(zip::result::ZipError),
+    /// The requested id was absent from the current Mojang manifest.
     VersionNotFound(String),
+    /// Required local version metadata or `client.jar` is missing.
     NotInstalled,
-    JavaVersionMismatch {
-        required: u32,
-        found: Option<u32>,
-    },
+    /// The `java` executable on `PATH` is absent, unparseable, or too old.
+    JavaVersionMismatch { required: u32, found: Option<u32> },
+    /// The process-local child slot still contains a running game.
     AlreadyRunning,
     /// The authenticated session expired and requires a fresh sign-in.
     AuthenticationExpired,
@@ -150,24 +172,26 @@ impl From<zip::result::ZipError> for FerriteError {
     }
 }
 
+/// Result type shared by Minecraft and mod-loader operations.
 pub type Result<T> = std::result::Result<T, FerriteError>;
 
 // =====================================================================
 // PUBLIC API — this is the only part `app.rs` should ever touch.
 // =====================================================================
 
-/// Downloads and installs the given official Minecraft Java version:
-/// version metadata, the client jar, all required libraries (and native
-/// libraries for the current OS), and the asset index + assets.
+/// Fetches release ids from Mojang's current version manifest.
 ///
-/// Already-downloaded files are skipped on subsequent calls, so calling
-/// this again later is cheap and effectively "verifies/repairs" the
-/// install. Multiple versions can coexist under `minecraft/versions/`.
+/// Results preserve manifest order (normally newest first). This always performs
+/// a network request and does not inspect which versions are installed locally.
 pub fn get_versions() -> Result<Vec<String>> {
     get_versions_with_snapshots(false)
 }
 
-/// Fetches selectable Minecraft versions, optionally including Mojang snapshots.
+/// Fetches selectable ids from Mojang's current version manifest.
+///
+/// When `show_snapshots` is `false`, only entries whose manifest type is exactly
+/// `release` are returned. When it is `true`, every manifest entry is returned,
+/// including snapshots and any other types Mojang publishes.
 pub fn get_versions_with_snapshots(show_snapshots: bool) -> Result<Vec<String>> {
     let client = Client::new();
     let manifest = fetch_manifest(&client)?;
@@ -180,7 +204,16 @@ pub fn get_versions_with_snapshots(show_snapshots: bool) -> Result<Vec<String>> 
         .collect())
 }
 
-/// Installs a version, printing progress messages to stdout.
+/// Downloads and installs an official Minecraft Java version, printing phase
+/// progress to stdout.
+///
+/// The pipeline stores metadata and the client jar under `versions/<id>/`,
+/// libraries under the shared Maven-style `libraries/` tree, assets under the
+/// shared content-addressed `assets/` tree, and extracted natives under
+/// `natives/<id>/`. Existing libraries, native jars, and asset objects are
+/// reused by path; the manifest, metadata, client jar, and asset index are
+/// fetched again. Failures return immediately and may leave a partial install
+/// that a later call can resume.
 pub fn install_version(version: &str) -> Result<()> {
     install_version_with_progress(version, |message| println!("{message}"))
 }
@@ -190,9 +223,12 @@ pub fn install_version(version: &str) -> Result<()> {
 /// The success message is emitted only after all phases complete; errors return
 /// immediately without reporting subsequent phases.
 ///
-/// The callback runs on the calling thread and receives borrowed messages. A UI
-/// worker can forward owned copies to the UI without making installation async.
-/// Per-file messages from download helpers still go to stdout.
+/// The callback runs synchronously on the calling thread. `FnMut` allows it to
+/// update captured progress state, while the borrowed `&str` means Ferrite does
+/// not transfer message ownership; callers that retain or send a message must
+/// clone it. No `Send`, `Sync`, or `'static` bound is required because this
+/// function neither stores the closure nor moves it to another thread. Per-file
+/// messages from download helpers still go to stdout.
 pub fn install_version_with_progress(version: &str, mut progress: impl FnMut(&str)) -> Result<()> {
     let client = Client::new();
 
@@ -332,6 +368,12 @@ pub fn launch_authenticated_with_memory(
     launch_with_auth(version, game_dir, placeholders, false, Some(memory_mb))
 }
 
+// Launch preparation is deliberately centralized so authenticated and offline
+// entry points cannot diverge. It rejects a live process and incomplete install,
+// loads the installed JSON, validates Java, builds an OS-filtered classpath,
+// fills authentication/filesystem placeholders, then transfers ownership of the
+// spawned `Child` into the global process slot. Errors before `spawn` leave the
+// slot untouched; a successful spawn is never silently downgraded to offline.
 fn launch_with_auth(
     version: &str,
     game_dir: &Path,
@@ -478,13 +520,24 @@ fn game_command(
     Ok(command)
 }
 
+// `OnceLock` lazily creates one slot for the whole process. `Mutex` is sufficient
+// because the slot itself has static shared ownership; an `Arc` is unnecessary
+// unless the slot must be passed outside this module. Lock poisoning currently
+// propagates as a panic through `unwrap`. The check in `launch_with_auth` and the
+// later store are separate lock acquisitions, so this is process management for
+// normal launcher use rather than a claim of atomic concurrent launch admission.
 static RUNNING_PROCESS: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
 
 fn process_slot() -> &'static Mutex<Option<Child>> {
     RUNNING_PROCESS.get_or_init(|| Mutex::new(None))
 }
 
-/// Returns `true` if Minecraft is currently running under this launcher.
+/// Returns whether this Ferrite process owns a child that has not exited.
+///
+/// `try_wait` is non-blocking. An observed exit clears and drops the stored
+/// handle. A polling error is treated as “not running” but leaves the handle in
+/// the slot so [`kill`] can still attempt cleanup. This does not detect games
+/// launched by another launcher process.
 pub fn is_running() -> bool {
     let mut slot = process_slot().lock().unwrap();
     match slot.as_mut() {
@@ -500,8 +553,11 @@ pub fn is_running() -> bool {
     }
 }
 
-/// Forcibly kills the running Minecraft process, if any. Safe to call
-/// even if nothing is running.
+/// Forcibly kills and reaps the child owned by this launcher, if any.
+///
+/// The handle is removed from the global slot before signaling it. A kill error
+/// is returned with the slot already empty; errors from the subsequent blocking
+/// `wait` are intentionally ignored. Calling this with no stored child succeeds.
 pub fn kill() -> Result<()> {
     let mut slot = process_slot().lock().unwrap();
     if let Some(mut child) = slot.take() {
@@ -561,28 +617,30 @@ fn copy_natives_tree(src: &Path, dst: &Path) -> Result<()> {
 // Filesystem layout
 // =====================================================================
 
-/// `pub(crate)`: Forge/NeoForge installers need the Minecraft root so they
-/// can write `versions/` and `libraries/` the same way the official
-/// launcher does.
+/// Returns the launcher-managed Minecraft root, relative to the current process
+/// working directory.
+///
+/// Forge and NeoForge installers receive this root so they write the same
+/// `versions/` and `libraries/` layout as the official launcher. This is not the
+/// platform's normal `.minecraft` directory and is not canonicalized here.
 pub(crate) fn base_dir() -> PathBuf {
     PathBuf::from("minecraft")
 }
-/// `pub(crate)`: reused by `crate::loaders::fabric` to locate (and
-/// create) a synthetic version's own directory the same way a vanilla
-/// version's is laid out.
+/// Returns `minecraft/versions/<id>`, used for both Mojang and synthetic loader
+/// versions. The path is constructed only; the directory is not created.
 pub(crate) fn version_dir(id: &str) -> PathBuf {
     base_dir().join("versions").join(id)
 }
-/// `pub(crate)`: mod loaders' extra libraries are downloaded into this
-/// same shared folder, right alongside vanilla's.
+/// Returns the shared Maven-style library cache at `minecraft/libraries/`.
+/// Vanilla and all loaders intentionally reuse artifacts in this tree.
 pub(crate) fn libraries_dir() -> PathBuf {
     base_dir().join("libraries")
 }
 fn assets_dir() -> PathBuf {
     base_dir().join("assets")
 }
-/// `pub(crate)`: reused by `copy_natives` and by loader modules that
-/// need the same `natives/<id>` path `launch_version` will look at.
+/// Returns the per-version native extraction/work directory at
+/// `minecraft/natives/<id>`. The path is constructed only.
 pub(crate) fn natives_dir(id: &str) -> PathBuf {
     base_dir().join("natives").join(id)
 }
@@ -762,6 +820,8 @@ struct AssetObject {
 // Install pipeline (private)
 // =====================================================================
 
+/// Fetches the manifest without a disk fallback; transport, status, and parse
+/// failures are returned to the caller.
 fn fetch_manifest(client: &Client) -> Result<Manifest> {
     let text = client
         .get(VERSION_MANIFEST_URL)
@@ -777,9 +837,12 @@ fn fetch_version_metadata(client: &Client, url: &str) -> Result<(VersionMetadata
     Ok((metadata, text))
 }
 
-/// `pub(crate)`: reused by `crate::loaders::fabric` to download library
-/// jars from a Maven repository the same way vanilla libraries are
-/// downloaded here.
+/// Downloads `url` into `dest` and replaces any existing file.
+///
+/// The caller must create the destination's parent directory. HTTP and write
+/// failures are fatal, but an `expected_size` mismatch only emits a warning;
+/// hashes are not verified. Passing `None` disables the size check, as required
+/// for loader repositories that do not publish sizes in profile metadata.
 pub(crate) fn download_file(
     client: &Client,
     url: &str,
@@ -799,6 +862,11 @@ pub(crate) fn download_file(
     Ok(())
 }
 
+// Walk metadata in order, applying Mojang's rules before touching a library.
+// Regular artifacts are cached in the shared Maven tree. Legacy classifier-based
+// native jars are cached there too, then extracted on every install so a missing
+// or partial per-version native directory is repaired; modern native artifacts
+// remain packed on the classpath for their libraries to unpack at runtime.
 fn download_libraries(
     client: &Client,
     libraries: &[LibraryEntry],
@@ -878,6 +946,9 @@ fn native_classifier_for_current_os(lib: &LibraryEntry) -> Option<String> {
     Some(raw.replace("${arch}", arch))
 }
 
+/// Extracts files from a legacy native JAR, preserving paths except for archive
+/// directories, `META-INF/`, and metadata-specified excluded prefixes. Existing
+/// destination files are replaced, allowing reinstalls to repair extracted data.
 fn extract_natives(jar_path: &Path, dest_dir: &Path, exclude: &[String]) -> Result<()> {
     let file = fs::File::open(jar_path)?;
     let mut archive = ZipArchive::new(file)?;
@@ -919,6 +990,12 @@ fn ensure_native_workdirs(natives_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+// Refresh the named index, then materialize each object at
+// `objects/<first-two-hash-chars>/<full-hash>`. Existing objects are trusted by
+// path and skipped. For a legacy virtual index, every object is additionally
+// copied to its original logical path under `virtual/<index>/`; those copies are
+// also skipped when present. Any network, parse, or filesystem error aborts the
+// remaining iteration while preserving completed cache entries.
 fn download_assets(
     client: &Client,
     index_url: &str,
@@ -1074,6 +1151,10 @@ fn classpath_separator() -> &'static str {
     }
 }
 
+/// Replaces every known `${name}` occurrence without shell parsing or escaping.
+/// Unknown placeholders remain literal so metadata can pass them through rather
+/// than being silently erased. Each returned argument is later passed directly
+/// to `Command`, so spaces in replacement values remain part of one argument.
 fn substitute(template: &str, placeholders: &HashMap<String, String>) -> String {
     let mut result = template.to_string();
     for (key, value) in placeholders {
@@ -1082,6 +1163,8 @@ fn substitute(template: &str, placeholders: &HashMap<String, String>) -> String 
     result
 }
 
+/// Flattens Mojang's plain and conditional argument entries in source order,
+/// omitting rule-disallowed entries and substituting each emitted string.
 fn resolve_arguments(
     entries: &[ArgumentEntry],
     placeholders: &HashMap<String, String>,
@@ -1156,6 +1239,8 @@ fn resolve_launch_arguments(
 // Authentication argument construction (never log these maps)
 // =====================================================================
 
+/// Builds owned placeholder values so the account borrows need only last for
+/// this call. The resulting map contains credentials and must never be logged.
 fn auth_placeholders(
     player_name: &str,
     uuid: &str,

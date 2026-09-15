@@ -1,5 +1,7 @@
-//! # MAIN.RS
-//! litterally just serves as a "start the program" script
+//! Native entry point for Ferrite Launcher.
+//!
+//! Application state and UI orchestration live in [`app`]; this module stays thin so
+//! eframe startup errors can propagate through `main` without duplicating setup.
 
 mod app;
 mod auth;
@@ -14,7 +16,7 @@ mod modrinth;
 mod packs;
 mod updates;
 
-/// Runs [`app::run`] and reports native window startup failures to the caller.
+/// Starts the native UI and returns any window/event-loop initialization error.
 fn main() -> eframe::Result {
     println!("Starting GUI!");
     app::run()

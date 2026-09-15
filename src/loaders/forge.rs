@@ -30,7 +30,10 @@
 //!
 //! A marker file (`forge-loader.txt`) records the synthetic id so
 //! `launch` / `is_installed` don't have to guess which folder the
-//! installer created.
+//! installer created. It is written only after metadata normalization, client
+//! selection, and native copying succeed. Installer output and Maven artifacts
+//! live in the shared relative `minecraft/` tree; a failed attempt may leave
+//! partial files there, but without a marker dispatch treats Forge as uninstalled.
 
 use crate::minecraft::{self, FerriteError, Result};
 use reqwest::blocking::Client;
@@ -47,7 +50,15 @@ pub fn install(mc_version: &str) -> Result<()> {
     install_version(mc_version, None)
 }
 
-/// Installs a requested Forge version, or the latest available build when omitted.
+/// Installs a requested Forge version, or the latest Maven-listed build.
+///
+/// The operation first ensures vanilla is complete, supplies compatibility files
+/// expected by Forge's official installer, downloads and runs that installer,
+/// discovers the version directory it produced, flattens inherited metadata,
+/// chooses a launchable client jar, copies natives, and finally writes the marker.
+/// A legacy `:universal` suffix on a pinned version is accepted and removed.
+/// Errors abort immediately; installer deletion is best-effort and only attempted
+/// after the installer returns successfully from [`run_installer`].
 pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> {
     minecraft::install_version(mc_version)?;
 
@@ -127,6 +138,9 @@ fn marker_path(mc_version: &str) -> PathBuf {
 // Version discovery
 // ---------------------------------------------------------------------
 
+/// Reads Forge's Maven metadata and selects the last exact-Minecraft match,
+/// relying on repository order to place newer builds later. No match becomes
+/// `LoaderVersionUnavailable`; request errors propagate.
 fn latest_forge_version(client: &Client, mc_version: &str) -> Result<String> {
     let meta_url = format!("{FORGE_MAVEN}/net/minecraftforge/forge/maven-metadata.xml");
     let text = client.get(&meta_url).send()?.error_for_status()?.text()?;
@@ -181,6 +195,11 @@ fn ensure_launcher_profiles(minecraft_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Runs the official installer synchronously against a canonicalized Minecraft
+/// root. Before execution it may create a patched temporary JAR that omits
+/// processor output hashes; that temporary is removed after Java exits, even for
+/// a non-zero status. Spawn/I/O failures propagate, while a non-zero exit captures
+/// status, stdout, and stderr in `InstallerFailed`.
 fn run_installer(installer: &Path, minecraft_dir: &Path) -> Result<()> {
     fs::create_dir_all(minecraft_dir)?;
     let minecraft_abs = fs::canonicalize(minecraft_dir)?;
@@ -233,6 +252,10 @@ fn run_installer(installer: &Path, minecraft_dir: &Path) -> Result<()> {
 /// zlib-ng (used as system zlib on several Linux distros) produces different
 /// compressed bytes for the same class files, so the official hashes fail
 /// even though the contents are valid. See MinecraftForge/Installer#80.
+///
+/// If no `install_profile.json` exists, the original path is returned unchanged.
+/// Otherwise entries are raw-copied, the profile is rewritten, and stale JAR
+/// signatures are omitted because changing a signed entry invalidates them.
 fn strip_processor_output_hashes(installer: &Path) -> Result<PathBuf> {
     let patched = installer.with_file_name(format!(
         "{}-noshahash.jar",
@@ -293,8 +316,13 @@ fn is_jar_signature(name: &str) -> bool {
             || upper.ends_with(".EC"))
 }
 
-/// Locates the version folder the installer just created. Forge usually
-/// names it `{mc}-forge-{forge}` (modern) or `{mc}-Forge{forge}` (old).
+/// Locates the version folder the installer just created.
+///
+/// Known modern and legacy names are checked first. As a compatibility fallback,
+/// every Forge-named version directory is scanned for JSON mentioning both the
+/// requested build and either the parent Minecraft id or an id containing it.
+/// Unreadable directories/files are skipped; exhausting the search is reported
+/// as `InstallerFailed` because Java had already claimed installation success.
 fn find_installed_forge_id(mc_version: &str, forge_version: &str) -> Result<String> {
     let candidates = [
         format!("{mc_version}-forge-{forge_version}"),
@@ -338,6 +366,9 @@ fn find_installed_forge_id(mc_version: &str, forge_version: &str) -> Result<Stri
     )))
 }
 
+/// Ensures the normalized layout has `client.jar`, preferring an existing client,
+/// then the installer's `<composite-id>.jar`, then vanilla's client. Copies replace
+/// only the missing destination and propagate filesystem errors.
 fn ensure_client_jar(
     composite_dir: &Path,
     composite_id: &str,
@@ -360,8 +391,13 @@ fn ensure_client_jar(
 // Metadata merging
 // ---------------------------------------------------------------------
 
-/// Overlay Forge's installer JSON onto vanilla. JVM args are merged as
-/// well — modern Forge's bootstrap launcher will not start without them.
+/// Flattens Forge's inherited metadata into an owned vanilla-shaped document.
+///
+/// Vanilla is cloned as the base. The synthetic id, Forge main class, normalized
+/// Forge libraries, and Forge game/JVM arguments are overlaid or appended in
+/// source order; `inheritsFrom` is removed because `minecraft.rs` does not resolve
+/// parent metadata. Missing optional Forge sections preserve vanilla behavior.
+/// JVM arguments are essential to modern Forge's bootstrap launcher.
 fn merge_inherited_metadata(
     composite_id: &str,
     vanilla: &serde_json::Value,
@@ -389,6 +425,8 @@ fn merge_inherited_metadata(
     merged
 }
 
+/// Appends one argument category without creating an empty array when neither
+/// parent contributes values.
 fn append_args(
     merged: &mut serde_json::Value,
     vanilla: &serde_json::Value,
@@ -452,6 +490,8 @@ fn normalize_library(lib: &serde_json::Value) -> serde_json::Value {
     out
 }
 
+/// Converts `group:artifact:version[:classifier]` to its Maven cache path.
+/// Missing required fields return `None`; later fields are ignored.
 fn maven_coordinate_to_path(coordinate: &str) -> Option<String> {
     let mut parts = coordinate.split(':');
     let group = parts.next()?;

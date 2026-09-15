@@ -18,6 +18,12 @@
 //! then merge the resulting `inheritsFrom` JSON with vanilla the same
 //! way `forge.rs` does, so `crate::minecraft::launch_version` can run
 //! the game without knowing NeoForge exists.
+//!
+//! All output uses Ferrite's relative shared `minecraft/` tree. The exact
+//! installer-created id is persisted in `neoforge-loader.txt` beside the vanilla
+//! version only after normalization, client selection, and native copying. Thus
+//! failed installs can leave reusable artifacts but are not launchable through
+//! dispatch until the marker is committed.
 
 use crate::minecraft::{self, FerriteError, Result};
 use reqwest::blocking::Client;
@@ -31,6 +37,8 @@ const LEGACY_META: &str =
 const MODERN_META: &str =
     "https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml";
 
+/// Maven artifact family and version representation selected for an install.
+/// Owning the strings keeps the value independent of temporary metadata buffers.
 enum NeoCoord {
     /// `net.neoforged:forge:{mc}-{neo}` (Minecraft 1.20.1).
     Legacy { full: String },
@@ -43,7 +51,14 @@ pub fn install(mc_version: &str) -> Result<()> {
     install_version(mc_version, None)
 }
 
-/// Installs a requested NeoForge version, or the latest available build when omitted.
+/// Installs a requested NeoForge version, or discovers the latest compatible build.
+///
+/// Minecraft 1.20.1 pins use the legacy `forge` artifact and are normalized to a
+/// full `1.20.1-<neo>` coordinate; newer pins use `neoforge` verbatim. The
+/// pipeline installs vanilla, satisfies official-installer prerequisites, runs
+/// Java synchronously, discovers its output, flattens inherited metadata, ensures
+/// a client jar, copies natives, and writes the marker last. Errors leave any
+/// completed shared-cache work in place. Installer-file removal is best-effort.
 pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> {
     minecraft::install_version(mc_version)?;
 
@@ -122,6 +137,8 @@ pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> 
     Ok(())
 }
 
+/// Reads the installer-created synthetic id recorded for `mc_version`.
+/// Any marker read failure is intentionally exposed as `LoaderNotInstalled`.
 pub fn installed_composite_id(mc_version: &str) -> Result<String> {
     fs::read_to_string(marker_path(mc_version))
         .map_err(|_| FerriteError::LoaderNotInstalled(mc_version.to_string()))
@@ -135,6 +152,12 @@ fn marker_path(mc_version: &str) -> PathBuf {
 // Version discovery
 // ---------------------------------------------------------------------
 
+/// Selects a coordinate from Maven metadata.
+///
+/// The 1.20.1 path takes the last exact legacy match. Modern Minecraft ids are
+/// converted to NeoForge's version prefix and the last exact/dot/dash-prefixed
+/// match is selected. Repository order is assumed oldest-to-newest. Unsupported
+/// id shapes and empty matches return `LoaderVersionUnavailable`.
 fn latest_neoforge_coord(client: &Client, mc_version: &str) -> Result<NeoCoord> {
     // 1.20.1 still lives under the old `net.neoforged:forge` artifact.
     if mc_version == "1.20.1" {
@@ -215,6 +238,10 @@ fn ensure_launcher_profiles(minecraft_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Runs the official installer synchronously using canonical paths. Spawn and
+/// filesystem failures propagate as `Io`; non-zero Java exits become
+/// `InstallerFailed` containing trimmed stdout and stderr. Successful output is
+/// intentionally not parsed here because the installer chooses the version id.
 fn run_installer(installer: &Path, minecraft_dir: &Path) -> Result<()> {
     fs::create_dir_all(minecraft_dir)?;
     let minecraft_abs = fs::canonicalize(minecraft_dir)?;
@@ -237,6 +264,12 @@ fn run_installer(installer: &Path, minecraft_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Discovers the version directory produced by the installer.
+///
+/// Common legacy and modern names are tried first. The fallback scans Forge- or
+/// NeoForge-named directories for JSON mentioning the selected build and enough
+/// evidence of the requested parent. Unreadable entries are skipped. No match
+/// after a successful installer run is classified as `InstallerFailed`.
 fn find_installed_neoforge_id(mc_version: &str, neo_label: &str) -> Result<String> {
     let candidates = [
         format!("neoforge-{neo_label}"),
@@ -281,6 +314,8 @@ fn find_installed_neoforge_id(mc_version: &str, neo_label: &str) -> Result<Strin
     )))
 }
 
+/// Ensures `client.jar` exists, preferring the existing normalized client, then
+/// the installer's id-named jar, and finally the vanilla client.
 fn ensure_client_jar(
     composite_dir: &Path,
     composite_id: &str,
@@ -303,6 +338,12 @@ fn ensure_client_jar(
 // Metadata merging
 // ---------------------------------------------------------------------
 
+/// Clones vanilla metadata and flattens NeoForge's inherited overlay.
+///
+/// The result owns all JSON data, removes `inheritsFrom`, adopts NeoForge's main
+/// class when present, appends normalized libraries, and appends game and JVM
+/// arguments in source order. Missing optional overlay sections preserve the
+/// vanilla values.
 fn merge_inherited_metadata(
     composite_id: &str,
     vanilla: &serde_json::Value,
@@ -330,6 +371,7 @@ fn merge_inherited_metadata(
     merged
 }
 
+/// Appends one argument category and avoids manufacturing an empty array.
 fn append_args(
     merged: &mut serde_json::Value,
     vanilla: &serde_json::Value,
@@ -352,6 +394,9 @@ fn append_args(
     }
 }
 
+/// Converts coordinate-only installer libraries into the artifact shape consumed
+/// by `minecraft.rs`. Already-normalized entries and unparseable coordinates are
+/// cloned unchanged; missing repositories fall back to NeoForge Maven.
 fn normalize_library(lib: &serde_json::Value) -> serde_json::Value {
     if lib
         .get("downloads")
@@ -388,6 +433,8 @@ fn normalize_library(lib: &serde_json::Value) -> serde_json::Value {
     out
 }
 
+/// Converts `group:artifact:version[:classifier]` to a Maven cache path.
+/// Missing required fields return `None`; later fields are ignored.
 fn maven_coordinate_to_path(coordinate: &str) -> Option<String> {
     let mut parts = coordinate.split(':');
     let group = parts.next()?;

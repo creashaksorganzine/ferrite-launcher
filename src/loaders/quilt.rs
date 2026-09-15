@@ -10,6 +10,12 @@
 //!
 //! After copying `client.jar`, we also `copy_natives` from the vanilla
 //! version into the synthetic id — same reason as `fabric.rs`.
+//!
+//! Loader libraries are cached in the shared `minecraft/libraries/` Maven tree.
+//! `minecraft/versions/<mc>/quilt-loader.txt` is the local source of truth for
+//! the installed synthetic id and is written only after the complete pipeline.
+//! A failed attempt can leave reusable metadata or jars, but no marker means
+//! dispatch reports Quilt as uninstalled.
 
 use crate::minecraft::{self, FerriteError, Result};
 use reqwest::blocking::Client;
@@ -26,7 +32,13 @@ pub fn install(mc_version: &str) -> Result<()> {
     install_version(mc_version, None)
 }
 
-/// Installs a requested Quilt version, or the latest stable build when omitted.
+/// Installs a requested Quilt version, or discovers the newest stable build.
+///
+/// Empty requested strings behave like no pin. A supplied version is validated
+/// when its profile is fetched. Without one, API order is treated as oldest to
+/// newest: the last stable entry wins, falling back to the final entry. Any
+/// error aborts before the marker is written, while completed vanilla/cache work
+/// remains available for a retry.
 pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> {
     minecraft::install_version(mc_version)?;
 
@@ -102,6 +114,9 @@ struct LoaderInfo {
     stable: bool,
 }
 
+/// Selects the newest stable entry from Quilt's oldest-first response, or the
+/// newest entry when no build is marked stable. Empty responses become
+/// `LoaderVersionUnavailable`; request and parse errors propagate unchanged.
 fn latest_stable_loader_version(client: &Client, mc_version: &str) -> Result<String> {
     let url = format!("{META_BASE}/{mc_version}");
     let text = client.get(&url).send()?.error_for_status()?.text()?;
@@ -135,10 +150,13 @@ fn fetch_profile(
 // Metadata merging
 // ---------------------------------------------------------------------
 
-/// Builds a synthetic vanilla-shaped version metadata JSON: identical
-/// to the vanilla version's own metadata, except for `id`, `mainClass`
-/// (taken from Quilt's profile), and `libraries` / `arguments.game`
-/// (vanilla's, with Quilt's appended).
+/// Builds an owned, vanilla-shaped metadata document for Quilt.
+///
+/// Vanilla is cloned first, preserving assets, downloads, and Java requirements.
+/// The synthetic id and optional Quilt main class replace their vanilla fields;
+/// convertible libraries and both game and JVM arguments are appended in profile
+/// order. Keeping Quilt JVM arguments is required for modern Knot/Mixin startup.
+/// Missing or malformed optional arrays simply contribute no additional values.
 fn merge_metadata(
     composite_id: &str,
     vanilla: &serde_json::Value,
@@ -213,6 +231,9 @@ fn convert_quilt_library(lib: &serde_json::Value) -> Option<serde_json::Value> {
     }))
 }
 
+/// Maps `group:artifact:version[:classifier]` to a Maven repository path.
+/// Missing required components return `None`; any components after the optional
+/// classifier are ignored.
 fn maven_coordinate_to_path(coordinate: &str) -> Option<String> {
     // "group.id:artifact:version[:classifier]" ->
     // "group/id/artifact/version/artifact-version[-classifier].jar"
@@ -234,6 +255,10 @@ fn maven_coordinate_to_path(coordinate: &str) -> Option<String> {
 // Library download
 // ---------------------------------------------------------------------
 
+/// Populates the shared library cache from Quilt's profile.
+///
+/// No library array is a successful no-op. Malformed entries are skipped,
+/// existing paths are trusted, and the first download/filesystem error aborts.
 fn download_quilt_libraries(client: &Client, profile: &serde_json::Value) -> Result<()> {
     let libs_dir = minecraft::libraries_dir();
     fs::create_dir_all(&libs_dir)?;

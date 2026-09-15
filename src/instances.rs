@@ -1,9 +1,24 @@
-//! Persistent launcher instance profiles.
+//! Persistence and filesystem layout for launcher instances.
 //!
-//! Installed Minecraft versions, libraries, and assets remain in Ferrite's
-//! shared `minecraft` directory. Each instance receives a separate game
-//! directory for its worlds, mods, configuration, logs, and resource packs.
-//! The small `instances.json` file records the profiles between launcher runs.
+//! Ferrite keeps downloaded Minecraft versions, libraries, and assets in its
+//! shared `minecraft` tree, while each [`InstanceProfile`] points at an isolated
+//! `minecraft/instances/<directory>` game directory. Worlds, mods, configuration,
+//! logs, and resource packs therefore belong to one profile without duplicating
+//! shared runtime files. All paths in this module are relative to the process's
+//! current working directory.
+//!
+//! Profile metadata is serialized as one JSON array in
+//! `minecraft/instances.json`. A missing file means no profiles; malformed JSON
+//! and filesystem failures are surfaced to the caller instead of being replaced
+//! with defaults. Saving uses a sibling temporary file followed by a rename, so
+//! readers do not observe a partially serialized document. This is replacement
+//! atomicity, not durable transactional storage: the code does not `fsync`, uses
+//! a fixed temporary name, and inherits the host platform's rename semantics.
+//!
+//! Directory identifiers created here are portable single components, but loaded
+//! metadata is deserialized as stored rather than revalidated. Callers should
+//! treat the launcher-owned metadata file as trusted and should persist a newly
+//! created profile before performing destructive operations on its game directory.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -14,7 +29,9 @@ use std::path::{Path, PathBuf};
 /// Errors produced while reading or writing the instance store.
 #[derive(Debug)]
 pub enum InstanceError {
+    /// Creating, reading, renaming, or deleting launcher files failed.
     Io(io::Error),
+    /// The profile array could not be serialized or deserialized.
     Json(serde_json::Error),
 }
 
@@ -49,8 +66,15 @@ pub struct InstanceProfile {
     /// The base Minecraft version, such as `1.21.1`.
     pub version: String,
     /// The serialized display label of the selected mod loader.
+    ///
+    /// This module stores the value opaquely; loader selection and validation
+    /// belong to the installation/launching layer.
     pub loader: String,
-    /// A safe directory name generated when the profile is created.
+    /// The relative component under `minecraft/instances` used for game data.
+    ///
+    /// New profiles receive a sanitized value. The field stays private so normal
+    /// callers cannot later redirect an instance, although Serde still restores
+    /// the value verbatim from the trusted profile store.
     directory: String,
 }
 
@@ -63,6 +87,8 @@ impl InstanceProfile {
         let base = directory_slug(&name);
         let mut directory = base.clone();
         let mut suffix = 2;
+        // Resolve collisions against stable directory identifiers rather than
+        // display names: names may differ while producing the same slug.
         while existing
             .iter()
             .any(|profile| profile.directory == directory)
@@ -80,6 +106,9 @@ impl InstanceProfile {
     }
 
     /// Returns this profile's isolated Minecraft game directory.
+    ///
+    /// This only constructs a relative path; it neither creates nor canonicalizes
+    /// the directory. Use [`create_game_dir`] when the directory must exist.
     pub fn game_dir(&self) -> PathBuf {
         instances_dir().join(&self.directory)
     }
@@ -88,7 +117,9 @@ impl InstanceProfile {
 /// Loads every saved profile.
 ///
 /// A missing store is treated as a new launcher installation. Invalid JSON is
-/// returned as an error rather than silently discarding user profiles.
+/// returned as an error rather than silently discarding user profiles. Serde
+/// restores all fields verbatim; semantic checks such as version availability,
+/// unique names, or directory-component validation are not performed here.
 pub fn load() -> Result<Vec<InstanceProfile>, InstanceError> {
     let path = store_path();
     match fs::read_to_string(path) {
@@ -98,10 +129,15 @@ pub fn load() -> Result<Vec<InstanceProfile>, InstanceError> {
     }
 }
 
-/// Atomically saves all profile metadata to `minecraft/instances.json`.
+/// Saves all profile metadata to `minecraft/instances.json` via replacement.
 ///
-/// Data is first written to a temporary sibling file and then renamed, which
-/// avoids leaving a partially written JSON document if writing fails.
+/// The complete, pretty-printed JSON array is first written to the fixed sibling
+/// `instances.json.tmp`, then renamed over the store. Keeping both files in one
+/// directory gives filesystems that support replacement rename an atomic
+/// old-or-new view and prevents a failed write from truncating the current store.
+/// The operation is not safe for concurrent writers, does not synchronize data
+/// to stable storage, and may fail when the platform cannot rename over an
+/// existing destination; all such failures are returned as [`InstanceError`].
 pub fn save(profiles: &[InstanceProfile]) -> Result<(), InstanceError> {
     let path = store_path();
     let parent = path
@@ -116,17 +152,22 @@ pub fn save(profiles: &[InstanceProfile]) -> Result<(), InstanceError> {
     Ok(())
 }
 
-/// Creates the game-data directory belonging to `profile`.
+/// Creates the game-data directory belonging to `profile` and any missing parents.
+///
+/// Existing directories are accepted. Other filesystem conflicts and permission
+/// failures are returned without changing profile metadata.
 pub fn create_game_dir(profile: &InstanceProfile) -> Result<(), InstanceError> {
     fs::create_dir_all(profile.game_dir())?;
     Ok(())
 }
 
-/// Deletes an instance's game data if it exists.
+/// Recursively deletes an instance's game-data path if it exists.
 ///
 /// Call this only after its metadata has successfully been removed from the
 /// saved profile list, so a failed metadata update never leaves a listed
-/// profile with its files unexpectedly deleted.
+/// profile with its files unexpectedly deleted. The existence check is only for
+/// convenient missing-path handling, not a synchronization or security boundary;
+/// deletion errors are returned to the caller.
 pub fn delete_game_dir(profile: &InstanceProfile) -> Result<(), InstanceError> {
     let path = profile.game_dir();
     if path.exists() {
@@ -135,15 +176,22 @@ pub fn delete_game_dir(profile: &InstanceProfile) -> Result<(), InstanceError> {
     Ok(())
 }
 
+/// Location of the JSON profile array, relative to the current working directory.
 fn store_path() -> PathBuf {
     Path::new("minecraft").join("instances.json")
 }
 
+/// Parent for per-profile game directories, relative to the current working directory.
 fn instances_dir() -> PathBuf {
     Path::new("minecraft").join("instances")
 }
 
-/// Converts a display name into a safe, portable directory component.
+/// Converts a display name into a portable ASCII directory component.
+///
+/// ASCII letters are lowercased, digits, `-`, and `_` are preserved, and every
+/// other Unicode scalar becomes `-`. Leading/trailing dashes are removed; an
+/// empty result falls back to `instance`. Uniqueness is added separately by
+/// [`InstanceProfile::new`].
 fn directory_slug(name: &str) -> String {
     let slug: String = name
         .chars()
