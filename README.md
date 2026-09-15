@@ -16,34 +16,7 @@ I also fucking hate when launchers don't let you customize the UI (when Feather 
 
 - Launch Minecraft (obviously)
 - Install Minecraft mod loaders
-<<<<<<< HEAD
-  - Fabric
-  - Forge
-  - NeoForge
-  - Quilt (currently not supported bc who tf uses Quilt)
-- Browse Modrinth (No Cursed Forge yet bc Modrinth is better... get over it)
-  - Mods
-  - Modpacks
-  - Plugins
-  - Resource packs
-  - Data packs
-  - Shaders
-- Discord Rich Presence
-- Instances
-  - Creating
-  - Exporting
-    - Export to `.ferritepack`
-    - Export to `.mrpack`
-    - Export to `.zip` (Generic)
-    - Export to `.zip` (CurseForge)
-    - Export to `.zip` (Prism / MultiMC)
-  - Importing (BUGGY AS FUCK!)
-    - Import from `.ferritepack`
-    - Import from `.mrpack`
-    - Import from `.zip` (Generic)
-    - Import from `.zip` (CurseForge)
-    - Import from `.zip` (Prism / MultiMC)
-=======
+  <<<<<<< HEAD
     - Fabric
     - Forge
     - NeoForge
@@ -70,7 +43,33 @@ I also fucking hate when launchers don't let you customize the UI (when Feather 
         - Import from `.zip` (Generic)
         - Import from `.zip` (CurseForge)
         - Import from `.zip` (Prism / MultiMC)
->>>>>>> ed8f178 (README and build.yml changes)
+          \=======
+        - Fabric
+        - Forge
+        - NeoForge
+        - Quilt (currently not supported bc who tf uses Quilt)
+- Browse Modrinth (No Cursed Forge yet bc Modrinth is better... get over it)
+    - Mods
+    - Modpacks
+    - Plugins
+    - Resource packs
+    - Data packs
+    - Shaders
+- Discord Rich Presence
+- Instances
+    - Creating
+    - Exporting
+        - Export to `.ferritepack`
+        - Export to `.mrpack`
+        - Export to `.zip` (Generic)
+        - Export to `.zip` (CurseForge)
+        - Export to `.zip` (Prism / MultiMC)
+    - Importing (BUGGY AS FUCK!)
+        - Import from `.ferritepack`
+        - Import from `.mrpack`
+        - Import from `.zip` (Generic)
+        - Import from `.zip` (CurseForge)
+        - Import from `.zip` (Prism / MultiMC)
 - Microsoft Authentication (Theoretically, if Microslop accepts me!)
 - Offline mode (so in the meantime you can still use Ferrite, just without online servers)
 
