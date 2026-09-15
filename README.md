@@ -42,7 +42,6 @@ I also fucking hate when launchers don't let you customize the UI (when Feather 
         - Import from `.zip` (Generic)
         - Import from `.zip` (CurseForge)
         - Import from `.zip` (Prism / MultiMC)
-          \=======
         - Fabric
         - Forge
         - NeoForge
