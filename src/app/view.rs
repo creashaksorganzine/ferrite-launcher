@@ -265,12 +265,7 @@ impl Ferrite {
                                 ui.horizontal_wrapped(|ui| {
                                     open_account |= ui.button("Account").clicked();
                                     if ui.button("Stop Game").clicked() {
-                                        self.running_text = match crate::minecraft::kill() {
-                                            Ok(()) => String::from("Game not running."),
-                                            Err(error) => {
-                                                format!("Failed to stop game: {error}")
-                                            }
-                                        };
+                                        self.stop_game();
                                     }
                                 });
                             });

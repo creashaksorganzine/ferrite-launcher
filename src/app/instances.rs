@@ -5,8 +5,8 @@
 //! preserving a clear commit point between filesystem preparation and visible state.
 
 use super::{
-    Ferrite, InstanceCreationEvent, InstanceCreationStage, MUTED, PackImportOutcome, PackTaskEvent,
-    Page, page_heading,
+    Ferrite, InstanceCreationEvent, InstanceCreationStage, PackImportOutcome, PackTaskEvent, Page,
+    page_heading,
 };
 use crate::instances::InstanceProfile;
 use crate::loaders::ModLoader;
@@ -581,6 +581,7 @@ impl Ferrite {
 
     /// Draws profile cards and executes at most one deferred card action afterward.
     pub(super) fn instances_page(&mut self, ui: &mut egui::Ui) {
+        let muted = self.muted_color();
         page_heading(ui, "Instances", "Manage your Minecraft profiles.");
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -609,7 +610,7 @@ impl Ferrite {
             ui.label(
                 RichText::new("No instances created yet.")
                     .size(20.0)
-                    .color(MUTED),
+                    .color(muted),
             );
             return;
         }
@@ -662,7 +663,7 @@ impl Ferrite {
                                 "Minecraft {}  •  {}",
                                 instance.version, instance.loader
                             ))
-                            .color(MUTED),
+                            .color(muted),
                         );
                         ui.horizontal(|ui| {
                             if ui
@@ -764,7 +765,7 @@ impl Ferrite {
                         }
                     });
                     if self.pack_path.is_empty() {
-                        ui.label(RichText::new("No pack selected.").color(MUTED));
+                        ui.label(RichText::new("No pack selected.").color(self.muted_color()));
                     } else {
                         ui.label(RichText::new(&self.pack_path).monospace());
                     }
@@ -859,7 +860,7 @@ impl Ferrite {
                         }
                     }
                     if self.pack_format == PackFormat::Lunar {
-                        ui.label(RichText::new("Direct .lcpack export is unavailable because Lunar does not publish its schema. Lunar can import the Modrinth and CurseForge formats.").color(MUTED));
+                        ui.label(RichText::new("Direct .lcpack export is unavailable because Lunar does not publish its schema. Lunar can import the Modrinth and CurseForge formats.").color(self.muted_color()));
                     }
                     let modded = self
                         .selected_instance()
@@ -879,7 +880,7 @@ impl Ferrite {
                         PackFormat::Modrinth | PackFormat::Prism | PackFormat::CurseForge
                     ) && self.pack_include_worlds
                     {
-                        ui.label(RichText::new("Warning: distributable packs normally exclude private worlds.").color(MUTED));
+                        ui.label(RichText::new("Warning: distributable packs normally exclude private worlds.").color(self.muted_color()));
                     }
                     if matches!(self.pack_format, PackFormat::Modrinth | PackFormat::CurseForge) {
                         ui.label("This is an override-based export: Ferrite does not invent provider project IDs or download provenance for local JARs.");

@@ -8,12 +8,14 @@
 
 mod auth;
 mod instances;
+mod layout;
 mod mods;
 mod settings;
 mod view;
 
 use crate::auth::Account;
-use crate::config::Config;
+use crate::background::BackgroundRenderer;
+use crate::config::{BackgroundSource, Config};
 use crate::discord::DiscordPresence;
 use crate::icons::IconCache;
 use crate::instance_mods::InstalledMod;
@@ -21,7 +23,7 @@ use crate::instances::InstanceProfile;
 use crate::modrinth::{ProjectDetails, SearchFilters, SearchResponse};
 use crate::packs::PackFormat;
 use crate::updates::{UpdateCheck, UpdateInfo};
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, Color32};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
@@ -56,7 +58,7 @@ pub fn run() -> eframe::Result {
 }
 
 /// A top-level destination in the launcher's sidebar.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Page {
     Play,
     Instances,
@@ -186,6 +188,10 @@ struct Ferrite {
     raw_config_toml: String,
     config_status: Option<String>,
     accent_edit: String,
+    /// Appearance editor target (`Global` or one of the top-level pages).
+    background_edit_target: String,
+    /// Loads and paints the selected background without blocking the UI thread.
+    background: BackgroundRenderer,
     close_requested: bool,
     /// One non-blocking GitHub release check and its session-only notification state.
     update_task: Option<Receiver<(bool, Result<UpdateCheck, String>)>>,
@@ -305,6 +311,8 @@ impl Default for Ferrite {
             raw_config_toml,
             config_status: None,
             accent_edit,
+            background_edit_target: "Global".to_owned(),
+            background: BackgroundRenderer::default(),
             close_requested: false,
             update_task: None,
             update_info: None,
@@ -373,7 +381,7 @@ impl eframe::App for Ferrite {
         self.poll_update_check();
         ui.ctx()
             .set_zoom_factor(self.config.appearance.font_scale.clamp(0.5, 2.0));
-        let mut visuals = if self.config.appearance.theme == "light" {
+        let mut visuals = if self.is_light_theme() {
             egui::Visuals::light()
         } else {
             egui::Visuals::dark()
@@ -381,64 +389,65 @@ impl eframe::App for Ferrite {
         let background = self.background_color();
         visuals.panel_fill = background;
         visuals.selection.bg_fill = self.accent_color();
+        visuals.override_text_color = Some(self.text_color());
         ui.style_mut().visuals = visuals;
         ui.style_mut().spacing.item_spacing = egui::vec2(10.0, 10.0);
-        ui.painter().rect_filled(ui.max_rect(), 0.0, background);
+        let viewport = ui.max_rect();
+        ui.painter().rect_filled(viewport, 0.0, background);
+        let background_settings = self.active_background_settings().clone();
+        let background_enabled = !matches!(background_settings.source, BackgroundSource::None);
+        let background_scope = self
+            .config
+            .appearance
+            .background
+            .use_per_page
+            .then_some(self.current_page);
+        self.background.paint(
+            ui.ctx(),
+            ui.painter(),
+            viewport,
+            &background_settings,
+            &background_scope,
+        );
 
-        let available_width = ui.available_width();
-        let available_height = ui.available_height();
-        ui.vertical(|ui| {
-            self.top_bar(ui);
-            ui.add_space(14.0);
-            egui::Frame::new()
-                .fill(background)
-                .inner_margin(egui::Margin::symmetric(28, 18))
-                .show(ui, |ui| {
-                    let content_width = (available_width - 56.0).max(0.0);
-                    let content_height = (available_height - 112.0).max(0.0);
-                    ui.set_width(content_width);
-                    ui.set_min_height(content_height);
-                    self.update_banner(ui);
-                    let page_height = (ui.available_height() - 34.0).max(0.0);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(content_width, page_height),
-                        egui::Layout::top_down(egui::Align::LEFT),
-                        |ui| match self.current_page {
-                            Page::Play => self.play_page(ui),
-                            Page::Instances => self.instances_page(ui),
-                            Page::Mods => self.mods_page(ui),
-                            Page::Settings => self.settings_page(ui),
-                        },
-                    );
-                    ui.separator();
-                    // Task-specific progress takes precedence over the durable general status.
-                    let status = if self.instance_creation_task.is_some() {
-                        self.instance_creation_status
-                            .as_deref()
-                            .unwrap_or(&self.running_text)
-                    } else if self.pack_task.is_some() {
-                        self.pack_status.as_deref().unwrap_or(&self.running_text)
+        if self.custom_layout_enabled() {
+            egui::ScrollArea::vertical()
+                .id_salt("custom_layout_canvas")
+                .show(ui, |ui| self.render_layout(ui));
+        } else {
+            let available_width = ui.available_width();
+            let available_height = ui.available_height();
+            ui.vertical(|ui| {
+                self.top_bar(ui);
+                ui.add_space(14.0);
+                egui::Frame::new()
+                    .fill(if background_enabled {
+                        Color32::TRANSPARENT
                     } else {
-                        &self.running_text
-                    };
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new("STATUS")
-                                .small()
-                                .strong()
-                                .color(self.accent_color()),
+                        background
+                    })
+                    .inner_margin(egui::Margin::symmetric(28, 18))
+                    .show(ui, |ui| {
+                        let content_width = (available_width - 56.0).max(0.0);
+                        let content_height = (available_height - 112.0).max(0.0);
+                        ui.set_width(content_width);
+                        ui.set_min_height(content_height);
+                        self.update_banner(ui);
+                        let page_height = (ui.available_height() - 34.0).max(0.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(content_width, page_height),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| match self.current_page {
+                                Page::Play => self.play_page(ui),
+                                Page::Instances => self.instances_page(ui),
+                                Page::Mods => self.mods_page(ui),
+                                Page::Settings => self.settings_page(ui),
+                            },
                         );
-                        ui.label(RichText::new(status).small().color(MUTED));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(format!("Ferrite {}", env!("CARGO_PKG_VERSION")))
-                                    .small()
-                                    .color(MUTED),
-                            );
-                        });
+                        self.layout_status_bar(ui);
                     });
-                });
-        });
+            });
+        }
 
         self.account_window(ui.ctx());
         self.create_instance_window(ui.ctx());
@@ -474,6 +483,8 @@ mod tests {
             raw_config_toml: crate::config::to_toml(&Config::default()).unwrap(),
             config_status: None,
             accent_edit: "#ff6600".into(),
+            background_edit_target: "Global".into(),
+            background: BackgroundRenderer::default(),
             close_requested: false,
             update_task: None,
             update_info: None,
@@ -518,6 +529,20 @@ mod tests {
             mod_task: None,
             discord: None,
         }
+    }
+
+    #[test]
+    fn background_selection_uses_global_or_current_page() {
+        let mut app = app();
+        app.config.appearance.background.global.opacity = 0.25;
+        app.config.appearance.background.play.opacity = 0.5;
+        app.config.appearance.background.mods.opacity = 0.75;
+
+        assert_eq!(app.active_background_settings().opacity, 0.25);
+        app.config.appearance.background.use_per_page = true;
+        assert_eq!(app.active_background_settings().opacity, 0.75);
+        app.current_page = Page::Play;
+        assert_eq!(app.active_background_settings().opacity, 0.5);
     }
 
     #[test]

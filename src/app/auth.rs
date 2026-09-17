@@ -5,7 +5,7 @@
 //! Cancellation drops the receiver and sets a shared atomic flag rather than waiting for
 //! the worker.
 
-use super::{AuthEvent, AuthTask, Ferrite, MUTED};
+use super::{AuthEvent, AuthTask, Ferrite};
 use eframe::egui::{self, RichText};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -126,7 +126,7 @@ impl Ferrite {
             ui.label("Offline mode uses the name 'Player' and does not require Microsoft sign-in.");
             ui.label(
                 RichText::new("Online-mode servers and paid-account services will not work.")
-                    .color(MUTED),
+                    .color(self.muted_color()),
             );
             return;
         }

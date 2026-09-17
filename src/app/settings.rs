@@ -4,11 +4,16 @@
 //! deliberately keeps raw TOML separate until explicit apply. Network update checks use
 //! a worker channel, while visual settings are read from central state every frame.
 
-use super::{ACCENT, BACKGROUND, CARD, Ferrite, MUTED, SIDEBAR, page_heading};
-use crate::config::Config;
+use super::{ACCENT, BACKGROUND, CARD, Ferrite, MUTED, Page, SIDEBAR, page_heading};
+use crate::background::BackgroundStatus;
+use crate::config::{
+    BackgroundFit, BackgroundSettings, BackgroundSource, Config, HorizontalAlignment, ThemePalette,
+    ThemePreset, VerticalAlignment,
+};
 use crate::discord::DiscordPresence;
 use crate::updates::UpdateCheck;
 use eframe::egui::{self, Color32, RichText};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, TryRecvError};
 
 impl Ferrite {
@@ -193,31 +198,129 @@ impl Ferrite {
         }
     }
 
+    pub(super) fn is_light_theme(&self) -> bool {
+        match self.config.appearance.theme_config.preset {
+            ThemePreset::Legacy => self.config.appearance.theme == "light",
+            ThemePreset::Dark => false,
+            ThemePreset::Light => true,
+            ThemePreset::Custom => {
+                let color = self.background_color();
+                (u32::from(color.r()) * 299
+                    + u32::from(color.g()) * 587
+                    + u32::from(color.b()) * 114)
+                    > 128_000
+            }
+        }
+    }
+
     pub(super) fn accent_color(&self) -> Color32 {
-        parse_hex_color(&self.config.appearance.accent).unwrap_or(ACCENT)
+        let value = match self.config.appearance.theme_config.preset {
+            ThemePreset::Custom => &self.config.appearance.theme_config.custom_palette.accent,
+            ThemePreset::Legacy | ThemePreset::Dark | ThemePreset::Light => {
+                &self.config.appearance.accent
+            }
+        };
+        parse_hex_color(value).unwrap_or(ACCENT)
     }
 
     pub(super) fn background_color(&self) -> Color32 {
-        if self.config.appearance.theme == "light" {
-            Color32::from_rgb(242, 244, 248)
-        } else {
-            BACKGROUND
+        match self.config.appearance.theme_config.preset {
+            ThemePreset::Legacy => {
+                if self.config.appearance.theme == "light" {
+                    Color32::from_rgb(242, 244, 248)
+                } else {
+                    BACKGROUND
+                }
+            }
+            ThemePreset::Dark => BACKGROUND,
+            ThemePreset::Light => Color32::from_rgb(242, 244, 248),
+            ThemePreset::Custom => parse_hex_color(
+                &self
+                    .config
+                    .appearance
+                    .theme_config
+                    .custom_palette
+                    .background,
+            )
+            .unwrap_or(BACKGROUND),
         }
     }
 
     pub(super) fn sidebar_color(&self) -> Color32 {
-        if self.config.appearance.theme == "light" {
-            Color32::from_rgb(226, 230, 237)
-        } else {
-            SIDEBAR
+        match self.config.appearance.theme_config.preset {
+            ThemePreset::Legacy => {
+                if self.config.appearance.theme == "light" {
+                    Color32::from_rgb(226, 230, 237)
+                } else {
+                    SIDEBAR
+                }
+            }
+            ThemePreset::Dark => SIDEBAR,
+            ThemePreset::Light => Color32::from_rgb(226, 230, 237),
+            ThemePreset::Custom => {
+                parse_hex_color(&self.config.appearance.theme_config.custom_palette.sidebar)
+                    .unwrap_or(SIDEBAR)
+            }
         }
     }
 
     pub(super) fn card_color(&self) -> Color32 {
-        if self.config.appearance.theme == "light" {
-            Color32::WHITE
-        } else {
-            CARD
+        match self.config.appearance.theme_config.preset {
+            ThemePreset::Legacy => {
+                if self.config.appearance.theme == "light" {
+                    Color32::WHITE
+                } else {
+                    CARD
+                }
+            }
+            ThemePreset::Dark => CARD,
+            ThemePreset::Light => Color32::WHITE,
+            ThemePreset::Custom => {
+                parse_hex_color(&self.config.appearance.theme_config.custom_palette.card)
+                    .unwrap_or(CARD)
+            }
+        }
+    }
+
+    pub(super) fn text_color(&self) -> Color32 {
+        match self.config.appearance.theme_config.preset {
+            ThemePreset::Legacy => {
+                if self.config.appearance.theme == "light" {
+                    Color32::BLACK
+                } else {
+                    Color32::WHITE
+                }
+            }
+            ThemePreset::Dark => Color32::WHITE,
+            ThemePreset::Light => Color32::BLACK,
+            ThemePreset::Custom => {
+                parse_hex_color(&self.config.appearance.theme_config.custom_palette.text)
+                    .unwrap_or(Color32::WHITE)
+            }
+        }
+    }
+
+    pub(super) fn muted_color(&self) -> Color32 {
+        match self.config.appearance.theme_config.preset {
+            ThemePreset::Custom => {
+                parse_hex_color(&self.config.appearance.theme_config.custom_palette.muted)
+                    .unwrap_or(MUTED)
+            }
+            ThemePreset::Legacy | ThemePreset::Dark | ThemePreset::Light => MUTED,
+        }
+    }
+
+    /// Resolves the global or current-page background selected by appearance settings.
+    pub(super) fn active_background_settings(&self) -> &BackgroundSettings {
+        let backgrounds = &self.config.appearance.background;
+        if !backgrounds.use_per_page {
+            return &backgrounds.global;
+        }
+        match self.current_page {
+            Page::Play => &backgrounds.play,
+            Page::Instances => &backgrounds.instances,
+            Page::Mods => &backgrounds.mods,
+            Page::Settings => &backgrounds.settings,
         }
     }
 
@@ -227,7 +330,7 @@ impl Ferrite {
         self.account_section(ui);
         ui.add_space(20.0);
         ui.horizontal(|ui| {
-            for tab in ["Global", "Launcher", "Appearance", "Advanced"] {
+            for tab in ["Global", "Launcher", "Appearance", "Layout", "Advanced"] {
                 if ui
                     .selectable_label(self.current_settings_tab == tab, tab)
                     .clicked()
@@ -239,7 +342,9 @@ impl Ferrite {
         ui.separator();
         ui.add_space(12.0);
 
-        match self.current_settings_tab.as_str() {
+        egui::ScrollArea::vertical()
+            .id_salt("settings_content")
+            .show(ui, |ui| match self.current_settings_tab.as_str() {
             "Global" => {
                 ui.heading("Global settings");
                 ui.label("Minecraft memory");
@@ -324,22 +429,47 @@ impl Ferrite {
             "Appearance" => {
                 ui.heading("Appearance");
                 let mut changed = false;
-                let previous_theme = self.config.appearance.theme.clone();
+                let previous_theme = self.config.appearance.theme_config.preset;
                 egui::ComboBox::from_label("Theme")
-                    .selected_text(capitalize(&self.config.appearance.theme))
+                    .selected_text(theme_preset_label(self.config.appearance.theme_config.preset))
                     .show_ui(ui, |ui| {
                         ui.selectable_value(
-                            &mut self.config.appearance.theme,
-                            "dark".to_owned(),
-                            "Dark",
+                            &mut self.config.appearance.theme_config.preset,
+                            ThemePreset::Legacy,
+                            "Classic / existing settings",
                         );
                         ui.selectable_value(
-                            &mut self.config.appearance.theme,
-                            "light".to_owned(),
-                            "Light",
+                            &mut self.config.appearance.theme_config.preset,
+                            ThemePreset::Dark,
+                            "Ferrite Dark",
+                        );
+                        ui.selectable_value(
+                            &mut self.config.appearance.theme_config.preset,
+                            ThemePreset::Light,
+                            "Ferrite Light",
+                        );
+                        ui.selectable_value(
+                            &mut self.config.appearance.theme_config.preset,
+                            ThemePreset::Custom,
+                            "Custom palette",
                         );
                     });
-                changed |= previous_theme != self.config.appearance.theme;
+                if previous_theme != self.config.appearance.theme_config.preset {
+                    if !matches!(
+                        self.config.appearance.theme_config.preset,
+                        ThemePreset::Legacy | ThemePreset::Custom
+                    ) {
+                        self.config.appearance.theme = if matches!(
+                            self.config.appearance.theme_config.preset,
+                            ThemePreset::Light
+                        ) {
+                            "light".to_owned()
+                        } else {
+                            "dark".to_owned()
+                        };
+                    }
+                    changed = true;
+                }
                 changed |= ui
                     .add(
                         egui::Slider::new(&mut self.config.appearance.font_scale, 0.5..=2.0)
@@ -354,25 +484,115 @@ impl Ferrite {
                     )
                     .changed();
 
-                ui.label("Accent color");
-                ui.horizontal(|ui| {
-                    let mut color = self.accent_color();
-                    if ui.color_edit_button_srgba(&mut color).changed() {
-                        self.config.appearance.accent = color_to_hex(color);
-                        self.accent_edit = self.config.appearance.accent.clone();
-                        changed = true;
-                    }
-                    ui.text_edit_singleline(&mut self.accent_edit);
-                    if ui.button("Apply color").clicked() {
-                        if let Some(color) = parse_hex_color(self.accent_edit.trim()) {
+                if matches!(
+                    self.config.appearance.theme_config.preset,
+                    ThemePreset::Custom
+                ) {
+                    ui.label("Custom theme palette");
+                    changed |= theme_palette_ui(
+                        ui,
+                        &mut self.config.appearance.theme_config.custom_palette,
+                    );
+                } else {
+                    ui.label("Accent color");
+                    ui.horizontal(|ui| {
+                        let mut color = self.accent_color();
+                        if ui.color_edit_button_srgba(&mut color).changed() {
                             self.config.appearance.accent = color_to_hex(color);
                             self.accent_edit = self.config.appearance.accent.clone();
                             changed = true;
-                        } else {
-                            self.config_status = Some("Accent must use #RRGGBB format.".to_owned());
                         }
+                        ui.text_edit_singleline(&mut self.accent_edit);
+                        if ui.button("Apply color").clicked() {
+                            if let Some(color) = parse_hex_color(self.accent_edit.trim()) {
+                                self.config.appearance.accent = color_to_hex(color);
+                                self.accent_edit = self.config.appearance.accent.clone();
+                                changed = true;
+                            } else {
+                                self.config_status =
+                                    Some("Accent must use #RRGGBB format.".to_owned());
+                            }
+                        }
+                    });
+                }
+                ui.separator();
+                ui.heading("Background image");
+                ui.label("The solid theme background remains active when the source is None.");
+
+                changed |= ui
+                    .checkbox(
+                        &mut self.config.appearance.background.use_per_page,
+                        "Use different backgrounds for each page",
+                    )
+                    .changed();
+
+                if self.config.appearance.background.use_per_page {
+                    if ui.button("Copy global background to every page").clicked() {
+                        let global = self.config.appearance.background.global.clone();
+                        self.config.appearance.background.play = global.clone();
+                        self.config.appearance.background.instances = global.clone();
+                        self.config.appearance.background.mods = global.clone();
+                        self.config.appearance.background.settings = global;
+                        changed = true;
                     }
-                });
+                    egui::ComboBox::from_label("Background to edit")
+                        .selected_text(&self.background_edit_target)
+                        .show_ui(ui, |ui| {
+                            for target in ["Play", "Instances", "Mods", "Settings"] {
+                                ui.selectable_value(
+                                    &mut self.background_edit_target,
+                                    target.to_owned(),
+                                    target,
+                                );
+                            }
+                        });
+                    if self.background_edit_target == "Global" {
+                        self.background_edit_target = "Play".to_owned();
+                    }
+                } else {
+                    self.background_edit_target = "Global".to_owned();
+                }
+
+                let target = self.background_edit_target.clone();
+                let background_changed = {
+                    let backgrounds = &mut self.config.appearance.background;
+                    let settings = match target.as_str() {
+                        "Play" => &mut backgrounds.play,
+                        "Instances" => &mut backgrounds.instances,
+                        "Mods" => &mut backgrounds.mods,
+                        "Settings" => &mut backgrounds.settings,
+                        _ => &mut backgrounds.global,
+                    };
+                    background_settings_ui(ui, settings)
+                };
+                changed |= background_changed;
+
+                let editing_visible_background =
+                    !self.config.appearance.background.use_per_page || target == "Settings";
+                if !editing_visible_background {
+                    ui.label(RichText::new(format!(
+                        "Open the {target} page to preview this background."
+                    )).color(MUTED));
+                } else {
+                    match self.background.status() {
+                    BackgroundStatus::Idle | BackgroundStatus::Disabled => {}
+                    BackgroundStatus::Loading => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Loading background image...");
+                        });
+                    }
+                    BackgroundStatus::Ready => {
+                        ui.label(
+                            RichText::new("Background image ready.").color(self.accent_color()),
+                        );
+                    }
+                    BackgroundStatus::Failed(error) => {
+                        ui.label(RichText::new(format!("Background failed: {error}")).color(MUTED));
+                    }
+                }
+                }
+
                 ui.separator();
                 ui.checkbox(
                     &mut self.is_appearance_checked,
@@ -381,6 +601,10 @@ impl Ferrite {
                 if changed {
                     self.save_config_change("Saved appearance settings.");
                 }
+            }
+            "Layout" => {
+                ui.heading("Layout and widgets");
+                self.layout_settings_ui(ui);
             }
             "Advanced" => {
                 ui.heading("Advanced configuration");
@@ -414,12 +638,285 @@ impl Ferrite {
                 }
             }
             _ => {}
-        }
+        });
 
         if let Some(status) = &self.config_status {
             ui.add_space(8.0);
             ui.label(status);
         }
+    }
+}
+
+fn theme_preset_label(preset: ThemePreset) -> &'static str {
+    match preset {
+        ThemePreset::Legacy => "Classic / existing settings",
+        ThemePreset::Dark => "Ferrite Dark",
+        ThemePreset::Light => "Ferrite Light",
+        ThemePreset::Custom => "Custom palette",
+    }
+}
+
+fn theme_palette_ui(ui: &mut egui::Ui, palette: &mut ThemePalette) -> bool {
+    let mut changed = false;
+    changed |= theme_color_row(ui, "Background", &mut palette.background);
+    changed |= theme_color_row(ui, "Sidebar", &mut palette.sidebar);
+    changed |= theme_color_row(ui, "Cards", &mut palette.card);
+    changed |= theme_color_row(ui, "Accent", &mut palette.accent);
+    changed |= theme_color_row(ui, "Text", &mut palette.text);
+    changed |= theme_color_row(ui, "Muted text", &mut palette.muted);
+    changed
+}
+
+fn theme_color_row(ui: &mut egui::Ui, label: &str, value: &mut String) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let mut color = parse_hex_color(value).unwrap_or(Color32::BLACK);
+        if ui.color_edit_button_srgba(&mut color).changed() {
+            *value = color_to_hex(color);
+            changed = true;
+        }
+        ui.monospace(value.as_str());
+    });
+    changed
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackgroundSourceKind {
+    None,
+    LocalFile,
+    HttpsUrl,
+    RandomFolder,
+}
+
+/// Edits one global/page background and reports whether persisted state changed.
+fn background_settings_ui(ui: &mut egui::Ui, settings: &mut BackgroundSettings) -> bool {
+    let mut changed = false;
+    let mut source_kind = match settings.source {
+        BackgroundSource::None => BackgroundSourceKind::None,
+        BackgroundSource::LocalFile { .. } => BackgroundSourceKind::LocalFile,
+        BackgroundSource::HttpsUrl { .. } => BackgroundSourceKind::HttpsUrl,
+        BackgroundSource::RandomFolder { .. } => BackgroundSourceKind::RandomFolder,
+    };
+    let previous_kind = source_kind;
+    egui::ComboBox::from_label("Source")
+        .selected_text(background_source_label(source_kind))
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut source_kind, BackgroundSourceKind::None, "None");
+            ui.selectable_value(
+                &mut source_kind,
+                BackgroundSourceKind::LocalFile,
+                "Local image",
+            );
+            ui.selectable_value(
+                &mut source_kind,
+                BackgroundSourceKind::HttpsUrl,
+                "HTTPS URL",
+            );
+            ui.selectable_value(
+                &mut source_kind,
+                BackgroundSourceKind::RandomFolder,
+                "Random image from folder",
+            );
+        });
+    if source_kind != previous_kind {
+        settings.source = match source_kind {
+            BackgroundSourceKind::None => BackgroundSource::None,
+            BackgroundSourceKind::LocalFile => BackgroundSource::LocalFile {
+                path: PathBuf::new(),
+            },
+            BackgroundSourceKind::HttpsUrl => BackgroundSource::HttpsUrl { url: String::new() },
+            BackgroundSourceKind::RandomFolder => BackgroundSource::RandomFolder {
+                path: PathBuf::new(),
+            },
+        };
+        changed = true;
+    }
+
+    match &mut settings.source {
+        BackgroundSource::None => {}
+        BackgroundSource::LocalFile { path } => {
+            ui.horizontal(|ui| {
+                let mut display = path.display().to_string();
+                if ui.text_edit_singleline(&mut display).changed() {
+                    *path = PathBuf::from(display);
+                    changed = true;
+                }
+                if ui.button("Choose Image...").clicked()
+                    && let Some(selected) = rfd::FileDialog::new()
+                        .set_title("Choose a background image")
+                        .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
+                        .pick_file()
+                {
+                    *path = selected;
+                    changed = true;
+                }
+            });
+        }
+        BackgroundSource::HttpsUrl { url } => {
+            ui.label("Only HTTPS URLs are loaded.");
+            changed |= ui.text_edit_singleline(url).changed();
+        }
+        BackgroundSource::RandomFolder { path } => {
+            ui.horizontal(|ui| {
+                let mut display = path.display().to_string();
+                if ui.text_edit_singleline(&mut display).changed() {
+                    *path = PathBuf::from(display);
+                    changed = true;
+                }
+                if ui.button("Choose Folder...").clicked()
+                    && let Some(selected) = rfd::FileDialog::new()
+                        .set_title("Choose a background image folder")
+                        .pick_folder()
+                {
+                    *path = selected;
+                    changed = true;
+                }
+            });
+            ui.label("A supported image is chosen at random and stays active until reloaded.");
+        }
+    }
+
+    if !matches!(settings.source, BackgroundSource::None) {
+        egui::ComboBox::from_label("Display mode")
+            .selected_text(background_fit_label(&settings.fit))
+            .show_ui(ui, |ui| {
+                changed |= ui
+                    .selectable_value(&mut settings.fit, BackgroundFit::Cover, "Cover")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut settings.fit, BackgroundFit::Contain, "Contain")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut settings.fit, BackgroundFit::Stretch, "Stretch")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut settings.fit, BackgroundFit::Tile, "Tile")
+                    .changed();
+            });
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_label("Horizontal")
+                .selected_text(horizontal_alignment_label(&settings.horizontal_alignment))
+                .show_ui(ui, |ui| {
+                    changed |= ui
+                        .selectable_value(
+                            &mut settings.horizontal_alignment,
+                            HorizontalAlignment::Left,
+                            "Left",
+                        )
+                        .changed();
+                    changed |= ui
+                        .selectable_value(
+                            &mut settings.horizontal_alignment,
+                            HorizontalAlignment::Center,
+                            "Center",
+                        )
+                        .changed();
+                    changed |= ui
+                        .selectable_value(
+                            &mut settings.horizontal_alignment,
+                            HorizontalAlignment::Right,
+                            "Right",
+                        )
+                        .changed();
+                });
+            egui::ComboBox::from_label("Vertical")
+                .selected_text(vertical_alignment_label(&settings.vertical_alignment))
+                .show_ui(ui, |ui| {
+                    changed |= ui
+                        .selectable_value(
+                            &mut settings.vertical_alignment,
+                            VerticalAlignment::Top,
+                            "Top",
+                        )
+                        .changed();
+                    changed |= ui
+                        .selectable_value(
+                            &mut settings.vertical_alignment,
+                            VerticalAlignment::Center,
+                            "Center",
+                        )
+                        .changed();
+                    changed |= ui
+                        .selectable_value(
+                            &mut settings.vertical_alignment,
+                            VerticalAlignment::Bottom,
+                            "Bottom",
+                        )
+                        .changed();
+                });
+        });
+        changed |= ui
+            .add(egui::Slider::new(&mut settings.opacity, 0.0..=1.0).text("Image opacity"))
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut settings.blur, 0.0..=100.0)
+                    .step_by(0.5)
+                    .text("Blur"),
+            )
+            .changed();
+
+        ui.label("Overlay color and opacity");
+        ui.horizontal(|ui| {
+            let mut overlay = parse_hex_color(&settings.overlay).unwrap_or(Color32::BLACK);
+            if ui.color_edit_button_srgba(&mut overlay).changed() {
+                settings.overlay = color_to_hex(overlay);
+                changed = true;
+            }
+            ui.monospace(&settings.overlay);
+        });
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut settings.overlay_opacity, 0.0..=1.0).text("Overlay opacity"),
+            )
+            .changed();
+
+        ui.horizontal(|ui| {
+            if ui.button("Reload / choose another").clicked() {
+                settings.reload_nonce = settings.reload_nonce.wrapping_add(1);
+                changed = true;
+            }
+            if ui.button("Reset background").clicked() {
+                *settings = BackgroundSettings::default();
+                changed = true;
+            }
+        });
+    }
+    changed
+}
+
+fn background_source_label(kind: BackgroundSourceKind) -> &'static str {
+    match kind {
+        BackgroundSourceKind::None => "None",
+        BackgroundSourceKind::LocalFile => "Local image",
+        BackgroundSourceKind::HttpsUrl => "HTTPS URL",
+        BackgroundSourceKind::RandomFolder => "Random image from folder",
+    }
+}
+
+fn background_fit_label(fit: &BackgroundFit) -> &'static str {
+    match fit {
+        BackgroundFit::Cover => "Cover",
+        BackgroundFit::Contain => "Contain",
+        BackgroundFit::Stretch => "Stretch",
+        BackgroundFit::Tile => "Tile",
+    }
+}
+
+fn horizontal_alignment_label(alignment: &HorizontalAlignment) -> &'static str {
+    match alignment {
+        HorizontalAlignment::Left => "Left",
+        HorizontalAlignment::Center => "Center",
+        HorizontalAlignment::Right => "Right",
+    }
+}
+
+fn vertical_alignment_label(alignment: &VerticalAlignment) -> &'static str {
+    match alignment {
+        VerticalAlignment::Top => "Top",
+        VerticalAlignment::Center => "Center",
+        VerticalAlignment::Bottom => "Bottom",
     }
 }
 
@@ -438,12 +935,4 @@ pub(super) fn parse_hex_color(value: &str) -> Option<Color32> {
 /// Serializes an egui color to the configuration's lowercase `#rrggbb` form.
 pub(super) fn color_to_hex(color: Color32) -> String {
     format!("#{:02x}{:02x}{:02x}", color.r(), color.g(), color.b())
-}
-
-pub(super) fn capitalize(value: &str) -> String {
-    let mut characters = value.chars();
-    match characters.next() {
-        Some(first) => first.to_uppercase().chain(characters).collect(),
-        None => String::new(),
-    }
 }

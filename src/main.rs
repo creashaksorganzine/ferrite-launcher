@@ -5,6 +5,7 @@
 
 mod app;
 mod auth;
+mod background;
 mod config;
 mod discord;
 mod icons;
